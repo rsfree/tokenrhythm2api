@@ -8,7 +8,7 @@
   "pool": {
     "strategy": "weighted_random",
     "top_k": 5,
-    "max_in_flight": 4,
+    "max_in_flight": 3,
     "max_in_flight_global": 0,
     "breaker_threshold": 3,
     "breaker_cooldown": "30s",

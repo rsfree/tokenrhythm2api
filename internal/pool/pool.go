@@ -38,6 +38,9 @@ const (
 	FailAuth                     // 401
 	FailQuota                    // 402/403
 	FailUpstream                 // 5xx / 网络 / 超时
+	// FailUpstreamRate 对应 429 + UPSTREAM_RATE_LIMITED：模型供应链侧限流。
+	// 换号救不了（换号打同一个模型照样被限），也不该罚号——罚下去会把整池一起关掉。
+	FailUpstreamRate
 )
 
 func (f FailKind) String() string {
@@ -50,6 +53,8 @@ func (f FailKind) String() string {
 		return "quota"
 	case FailUpstream:
 		return "upstream"
+	case FailUpstreamRate:
+		return "upstream_rate"
 	default:
 		return "client"
 	}
@@ -115,6 +120,9 @@ type PickRequest struct {
 	StickyKeyID string
 	// SessionKey 是会话指纹，用于命中上游 prompt cache；0 表示不启用。
 	SessionKey uint64
+	// PreferKeyID 是"还是这个号再试一次"的软偏好：只在它可用、没满载时照办，
+	// 否则照常往下选。模型供应链限流时换号无意义，只会多烧一个号的配额。
+	PreferKeyID string
 }
 
 type sessionEntry struct {
@@ -343,6 +351,14 @@ func (p *Pool) Acquire(req PickRequest) (*Lease, error) {
 	// ① 视频任务粘性
 	if req.StickyKeyID != "" {
 		if k := p.keys[req.StickyKeyID]; k != nil && k.Enabled {
+			return p.leaseLocked(k, now), nil
+		}
+	}
+
+	// ①.5 软偏好：上游按模型限流时，重试仍落回原号最省配额。
+	if req.PreferKeyID != "" {
+		if k := p.keys[req.PreferKeyID]; k != nil && k.Enabled &&
+			!req.Tried[k.ID] && p.usable(k, now) && !p.inflightFull(k) && !p.floorBlocked(k, req.Paid) {
 			return p.leaseLocked(k, now), nil
 		}
 	}
@@ -693,6 +709,12 @@ func (p *Pool) blockReasonLocked(now time.Time) string {
 // Release 归还在途名额，并按 outcome 更新状态。
 // err 为 nil 表示成功。
 func (p *Pool) Release(l *Lease, kind *FailKind, msg string) {
+	p.ReleaseWithHint(l, kind, msg, 0)
+}
+
+// ReleaseWithHint 与 Release 相同，额外接一个"上游说多久后恢复"的提示。
+// 有明确值就按它冷却，不再指数放大：429 只是配额用完，指数退避会把一个健康的号白关十几分钟。
+func (p *Pool) ReleaseWithHint(l *Lease, kind *FailKind, msg string, retryAfter time.Duration) {
 	if l == nil {
 		return
 	}
@@ -722,10 +744,10 @@ func (p *Pool) Release(l *Lease, kind *FailKind, msg string) {
 	k.Errors++
 	k.LastError = truncate(msg, 240)
 	k.LastErrorAt = now
-	p.applyFailLocked(k, *kind, now)
+	p.applyFailLocked(k, *kind, now, retryAfter)
 }
 
-func (p *Pool) applyFailLocked(k *Key, kind FailKind, now time.Time) {
+func (p *Pool) applyFailLocked(k *Key, kind FailKind, now time.Time, retryAfter time.Duration) {
 	cfg := p.cfg
 	switch kind {
 	case FailClient:
@@ -737,13 +759,26 @@ func (p *Pool) applyFailLocked(k *Key, kind FailKind, now time.Time) {
 		k.State = StateExhausted
 		k.CooldownUntil = now.Add(cfg.ExhaustedCooldown.Duration())
 	case FailRate:
-		k.FailStreak++
-		d := cfg.RateCooldown.Duration() * time.Duration(1<<uint(min(k.FailStreak-1, 6)))
+		// 上游给了恢复时间就照它来（实测每号 30 次/15 秒窗口，retryAfter 13~15s）；
+		// 只有"没给"的时候才用默认值并指数退避。
+		var d time.Duration
+		if retryAfter > 0 {
+			d = retryAfter
+		} else {
+			k.FailStreak++
+			d = cfg.RateCooldown.Duration() * time.Duration(1<<uint(min(k.FailStreak-1, 6)))
+		}
+		if d < time.Second {
+			d = time.Second
+		}
 		if c := cfg.RateMax.Duration(); c > 0 && d > c {
 			d = c
 		}
 		k.State = StateCooling
 		k.CooldownUntil = now.Add(d)
+	case FailUpstreamRate:
+		// 模型供应链限流，跟这个号没关系：状态不动，由请求层短暂退避后重试。
+		return
 	case FailUpstream:
 		k.FailStreak++
 		if k.FailStreak < cfg.BreakerThreshold {
@@ -771,7 +806,7 @@ func (p *Pool) MarkFail(id string, kind FailKind, msg string) {
 	k.Errors++
 	k.LastError = truncate(msg, 240)
 	k.LastErrorAt = time.Now()
-	p.applyFailLocked(k, kind, time.Now())
+	p.applyFailLocked(k, kind, time.Now(), 0)
 	p.notify()
 }
 

@@ -493,3 +493,88 @@ func TestBatchStateReportsInflight(t *testing.T) {
 		t.Fatal("释放后在途应归零")
 	}
 }
+
+// 429 带了 retryAfter 就按它冷却：不套默认 20s，也不乘 2^n。
+func TestRateLimitHonorsRetryAfter(t *testing.T) {
+	p := New(testCfg())
+	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
+
+	l, err := p.Acquire(PickRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("选号失败: %v", err)
+	}
+	kind := FailRate
+	p.ReleaseWithHint(l, &kind, "429 RATE_LIMITED", 15*time.Second)
+
+	if st := p.keys[k.ID].State; st != StateCooling {
+		t.Fatalf("状态 = %s，期望 cooling", st)
+	}
+	if d := time.Until(p.keys[k.ID].CooldownUntil); d < 13*time.Second || d > 17*time.Second {
+		t.Fatalf("冷却 = %v，期望约 15s（按 retryAfter 原值，不再指数放大）", d)
+	}
+}
+
+// 同一种 429 重复十次也不该把冷却放大——retryAfter 是权威值。
+func TestRateLimitDoesNotEscalateWithHint(t *testing.T) {
+	p := New(testCfg())
+	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
+	kind := FailRate
+	for i := 0; i < 10; i++ {
+		p.MarkFail(k.ID, kind, "429 RATE_LIMITED")
+		p.Reset(k.ID)
+	}
+	l, err := p.Acquire(PickRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("选号失败: %v", err)
+	}
+	p.ReleaseWithHint(l, &kind, "429 RATE_LIMITED", 15*time.Second)
+	if d := time.Until(p.keys[k.ID].CooldownUntil); d > 20*time.Second {
+		t.Fatalf("冷却 = %v，带提示时不该被历史失败次数放大", d)
+	}
+}
+
+// 模型侧限流不是号的错：状态必须留在 active，且还能被选到。
+func TestUpstreamRateDoesNotPunishKey(t *testing.T) {
+	p := New(testCfg())
+	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
+
+	l, err := p.Acquire(PickRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("选号失败: %v", err)
+	}
+	kind := FailUpstreamRate
+	p.ReleaseWithHint(l, &kind, "429 UPSTREAM_RATE_LIMITED", 3*time.Second)
+
+	if st := p.keys[k.ID].State; st != StateActive {
+		t.Fatalf("状态 = %s，期望 active（不罚号）", st)
+	}
+	if k.FailStreak != 0 {
+		t.Errorf("FailStreak = %d，期望 0", k.FailStreak)
+	}
+	if _, err := p.Acquire(PickRequest{Model: "m"}); err != nil {
+		t.Fatalf("号应仍可被选中: %v", err)
+	}
+}
+
+// PreferKeyID 只是软偏好：目标号在冷却时不能被强行放行。
+func TestPreferKeyIDFallsBackWhenCooling(t *testing.T) {
+	p := New(testCfg())
+	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
+	mustAdd(t, p, "b", "sk_tr_bbbb", 0)
+
+	l, err := p.Acquire(PickRequest{Model: "m"})
+	if err != nil {
+		t.Fatalf("选号失败: %v", err)
+	}
+	kind := FailRate
+	p.ReleaseWithHint(l, &kind, "429", 30*time.Second)
+
+	lease, err := p.Acquire(PickRequest{Model: "m", PreferKeyID: l.KeyID})
+	if err != nil {
+		t.Fatalf("应回落到其它号: %v", err)
+	}
+	if lease.KeyID == l.KeyID {
+		t.Fatalf("冷却中的号不该被偏好放行")
+	}
+	p.Release(lease, nil, "")
+}

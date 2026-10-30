@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -150,6 +151,9 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	sessKey := sessionKey(body, h.cfg.Pool.SessionSticky.PrefixAffinity)
 
 	tried := map[string]bool{}
+	// 模型侧限流时记下这个号，下一次尝试仍落回它：换号等于把另一个号的配额也烧掉。
+	preferKey := ""
+	lastKey := "" // 同号重试不算"换号"，统计口径要分开
 	maxAttempts := h.cfg.Pool.RetryMax
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -167,6 +171,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 			Tried:       tried,
 			StickyKeyID: stickyKey,
 			SessionKey:  sessKey,
+			PreferKeyID: preferKey,
 		})
 		if err != nil {
 			// 已经有上游错误时保留它：把上游的 500 改写成网关的 503，
@@ -179,10 +184,14 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[lease.KeyID] = true
+		preferKey = ""
 		if attempt > 1 {
 			h.stats.Retries.Add(1)
-			h.stats.Switched.Add(1)
+			if lease.KeyID != lastKey {
+				h.stats.Switched.Add(1)
+			}
 		}
+		lastKey = lease.KeyID
 
 		ctx, cancel := context.WithTimeout(r.Context(), h.timeoutFor(isVideoCreate || isVideoQuery))
 		res, err := h.up.Do(ctx, r.Method, path, body, lease.Secret, r.Header, stream, isVideoCreate || isVideoQuery)
@@ -200,14 +209,25 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if res.Status >= 400 {
 			res.Close()
 			cancel()
-			kind := classify(res.Status, res.Body)
+			kind, retryAfter := classify(res)
 			msg := errorMessage(res.Body)
-			h.pool.Release(lease, &kind, msg)
+			h.pool.ReleaseWithHint(lease, &kind, msg, retryAfter)
 			lastStatus, lastBody, lastTrace, lastErr = res.Status, res.Body, res.TraceID, msg
 			h.charge(lease, model, path, res.Status, 0, 0, 0, attempt, start, true, msg)
 			// 4xx 是请求本身的问题：换号也没用，立即返回。
 			if kind == pool.FailClient {
 				break
+			}
+			if kind == pool.FailUpstreamRate && attempt < maxAttempts {
+				// 模型侧限流跟号无关：短暂退避后优先用同一个号再试一次。
+				select {
+				case <-time.After(h.upstreamRateBackoff(attempt, retryAfter)):
+				case <-r.Context().Done():
+					return
+				}
+				delete(tried, lease.KeyID)
+				preferKey = lease.KeyID
+				continue
 			}
 			continue
 		}
@@ -413,14 +433,24 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
-func classify(status int, body []byte) pool.FailKind {
+// classify 把上游响应翻译成号池的失败类型，并顺带取出"多久后恢复"的提示。
+//
+// 429 有两种，状态码一样但处置相反，必须看 body：
+//
+//	RATE_LIMITED          本平台的次数配额（实测每号 30 次/约 15 秒窗口）→ 罚号，按 retryAfter 冷却
+//	UPSTREAM_RATE_LIMITED 模型供应链限流 → 换号救不了，不罚号，退避后同号重试
+func classify(res *upstream.Result) (pool.FailKind, time.Duration) {
+	status, body := res.Status, res.Body
 	switch {
 	case status == http.StatusUnauthorized:
-		return pool.FailAuth
+		return pool.FailAuth, 0
 	case status == http.StatusPaymentRequired:
-		return pool.FailQuota
+		return pool.FailQuota, 0
 	case status == http.StatusTooManyRequests:
-		return pool.FailRate
+		if bytes.Contains(body, []byte("UPSTREAM_RATE_LIMITED")) {
+			return pool.FailUpstreamRate, retryAfterFrom(res)
+		}
+		return pool.FailRate, retryAfterFrom(res)
 	case status == http.StatusForbidden:
 		// 403 是同一个状态码、三种完全不同的意思，必须看 body 才能判：
 		//   ACCOUNT_SUSPENDED   账号被临时冻结 → 是这个号的问题，冷却+换号
@@ -428,19 +458,59 @@ func classify(status int, body []byte) pool.FailKind {
 		//   其它                认不出来 → 冷却久一点，别反复撞
 		switch {
 		case bytes.Contains(body, []byte("ACCOUNT_SUSPENDED")):
-			return pool.FailRate
+			return pool.FailRate, retryAfterFrom(res)
 		case bytes.Contains(body, []byte("MODEL_ACCESS_DENIED")),
 			bytes.Contains(body, []byte("灰度")):
-			return pool.FailClient
+			return pool.FailClient, 0
 		default:
-			return pool.FailQuota
+			return pool.FailQuota, 0
 		}
 	case status >= 500:
-		return pool.FailUpstream
+		return pool.FailUpstream, 0
 	case status >= 400:
-		return pool.FailClient
+		return pool.FailClient, 0
 	}
-	return pool.FailClient
+	return pool.FailClient, 0
+}
+
+// retryAfterFrom 依次看 Retry-After 头与 body 里的 data.retryAfterSeconds，
+// 都没有就返回 0，交给配置里的默认冷却。
+func retryAfterFrom(res *upstream.Result) time.Duration {
+	if v := strings.TrimSpace(res.Header.Get("Retry-After")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+		if t, err := http.ParseTime(v); err == nil {
+			if d := time.Until(t); d > 0 {
+				return d
+			}
+		}
+	}
+	var m struct {
+		Data struct {
+			RetryAfterSeconds float64 `json:"retryAfterSeconds"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(res.Body, &m) == nil && m.Data.RetryAfterSeconds > 0 {
+		return time.Duration(m.Data.RetryAfterSeconds * float64(time.Second))
+	}
+	return 0
+}
+
+// upstreamRateBackoff 是模型侧限流的退避：听上游的提示，但最多 5s，
+// 免得把同步请求拖到客户端自己超时。
+func (h *Handler) upstreamRateBackoff(attempt int, hint time.Duration) time.Duration {
+	if hint > 0 {
+		if hint > 5*time.Second {
+			return 5 * time.Second
+		}
+		return hint
+	}
+	d := time.Duration(attempt) * 700 * time.Millisecond
+	if d > 3*time.Second {
+		return 3 * time.Second
+	}
+	return d
 }
 
 func errorMessage(body []byte) string {

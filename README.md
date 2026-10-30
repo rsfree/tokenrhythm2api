@@ -192,7 +192,8 @@ batch 是软约束——里面的号全满或被 `tried` 排除时会自动放�
 | **403 + `ACCOUNT_SUSPENDED`** | 账号被临时冻结 | 冷却 30 分钟，换号继续 |
 | **403 + `MODEL_ACCESS_DENIED`** | 模型未开通 / 未灰度 | **不罚号**，原样返回客户端，不重试 |
 | **403 + 其它** | 认不出来 | 冷却 30 分钟（保守处理） |
-| 429 | 容量限流 | `cooling`，指数退避（20s 起，上限 10m） |
+| **429 + `RATE_LIMITED`** | 本平台次数配额（实测 30 次/约 15 秒窗口） | `cooling`，按 `retryAfterSeconds` 冷却；没给提示才 20s 起指数退避 |
+| **429 + `UPSTREAM_RATE_LIMITED`** | 模型供应链限流 | **不罚号**，退避 ≤5s 后优先同号重试 |
 | 5xx / 超时 | 上游故障 | 累计 3 次后熔断，冷却 30s 起、指数退避 |
 | 4xx 其他 | 请求本身有问题 | **不罚号**，立即返回 |
 
@@ -244,7 +245,10 @@ POST   /panel/api/prices            刷新价目表
 - **密钥不落盘**：`admin_key` / `client_keys` 优先读环境变量；写回 `config.json` 时只替换 `pool` 段，不会把密钥写进文件。
 - **自动探活**：默认每 2 分钟用 `/v1/models` 探一遍 `cooling`/`invalid` 的号，探活成功自动复位。
   探活只打 `/v1/models`，不消耗生成额度。
-- **并发**：单号默认 `max_in_flight=4`，全局默认不限。过大会把上游 429 提前触发。
+- **并发**：单号默认 `max_in_flight=3`，全局默认不限。
+  实测 tokenrhythm 的上限是**每号 30 次/约 15 秒滑动窗口（≈2 QPS）**，不是并发数——
+  31 并发时正好 30 过 1 拒，而当时串行的 6 个也会被拒。所以安全在飞数 ≈ `2 × 响应耗时`，
+  1.5s 响应时约 3 个；超了返 429 `RATE_LIMITED` + `retryAfterSeconds`（13~15s 自愈），网关按它精确冷却。
 - **`include_usage` 注入**：流式 `/v1/chat/completions` 会强制 `stream_options.include_usage=true`，
   否则拿不到 usage、记账只能估算。多出来的那个 usage chunk 是 OpenAI 官方语义，SDK 会正常忽略。
 

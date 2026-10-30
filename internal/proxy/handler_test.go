@@ -302,3 +302,59 @@ func TestUpstreamAllFailReturnsLastError(t *testing.T) {
 		}
 	}
 }
+
+// 两种 429 必须分清：RATE_LIMITED 罚号并按 retryAfter 冷却，UPSTREAM_RATE_LIMITED 不罚号。
+func TestClassify429Kinds(t *testing.T) {
+	mk := func(body string) *upstream.Result {
+		return &upstream.Result{Status: 429, Body: []byte(body), Header: http.Header{}}
+	}
+	kind, d := classify(mk(`{"code":"RATE_LIMITED","message":"请求过于频繁","data":{"limit":30,"retryAfterSeconds":11}}`))
+	if kind != pool.FailRate || d != 11*time.Second {
+		t.Fatalf("RATE_LIMITED 判成 %v/%v，期望 FailRate/11s", kind, d)
+	}
+	kind, _ = classify(mk(`{"code":"UPSTREAM_RATE_LIMITED","message":"上游容量不足"}`))
+	if kind != pool.FailUpstreamRate {
+		t.Fatalf("UPSTREAM_RATE_LIMITED 判成 %v，期望 FailUpstreamRate", kind)
+	}
+	r := mk(`{"code":"RATE_LIMITED","data":{"retryAfterSeconds":11}}`)
+	r.Header.Set("Retry-After", "7")
+	if _, d := classify(r); d != 7*time.Second {
+		t.Fatalf("应优先用 Retry-After 头，实际 %v", d)
+	}
+}
+
+// 429 + UPSTREAM_RATE_LIMITED 是模型侧限流：不罚号，退避后仍用同一个号重试。
+func TestUpstreamRateLimitRetriesSameKey(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		n := len(auths)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(429)
+			_, _ = w.Write([]byte(`{"code":"UPSTREAM_RATE_LIMITED","message":"上游容量不足"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`))
+	}, "sk_tr_a", "sk_tr_b")
+
+	resp := f.do(t, "POST", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("应退避后成功，实际 %d", resp.StatusCode)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("上游应被调 2 次，实际 %d", len(auths))
+	}
+	if auths[0] != auths[1] {
+		t.Errorf("应同号重试，实际先 %s 后 %s", auths[0], auths[1])
+	}
+	for _, v := range f.p.Views() {
+		if v.State != "active" {
+			t.Errorf("号 %s 被上游限流打成了 %s", v.Name, v.State)
+		}
+	}
+}
