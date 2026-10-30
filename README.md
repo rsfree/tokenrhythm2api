@@ -1,5 +1,8 @@
 # trpool — TokenRhythm 号池网关
 
+[![Release](https://img.shields.io/github/v/release/rsfree/tokenrhythm2api)](https://github.com/rsfree/tokenrhythm2api/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 把多个 `sk_tr_` 密钥池化成一个入口：客户端只认一把 key，网关负责选号、换号、冷却、记账。
 
 参考 `workbuddy2api` 的号池骨架（候选过滤 → 短名单加权抽签 → 熔断冷却 → 粘性会话），
