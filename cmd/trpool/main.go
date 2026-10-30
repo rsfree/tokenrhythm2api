@@ -31,10 +31,17 @@ import (
 // version 由发布流水线通过 -ldflags "-X main.version=vX.Y.Z" 注入。
 var version = "dev"
 
+// persistLogs 是随状态文件一起落盘的日志条数上限。
+// 取 200：够覆盖"最近一小时的排查窗口"，又不至于让 5 秒一次的重写变得笨重。
+const persistLogs = 200
+
 type stateFile struct {
 	Pool  pool.Snapshot `json:"pool"`
 	Daily *ledger.Daily `json:"daily"`
-	Saved string        `json:"saved_at"`
+	// Logs 是最后的请求日志（倒序）。它不进账本口径，纯粹为了重启后还能查
+	// "刚才那个 429 是哪个号打的" —— 排查最需要的就是这一小时内发生过什么。
+	Logs  []ledger.Entry `json:"logs,omitempty"`
+	Saved string         `json:"saved_at"`
 }
 
 func main() {
@@ -64,7 +71,7 @@ func main() {
 	up := upstream.New(cfg.Upstream, cfg.Pool.UpstreamTimeout.Duration(), cfg.Pool.VideoTimeout.Duration())
 
 	statePath := filepath.Join(cfg.DataDir, "state.json")
-	loadState(statePath, p, daily)
+	loadState(statePath, p, daily, lg)
 	seedFromEnv(p)
 
 	h := proxy.New(cfg, p, up, prices, lg, daily)
@@ -128,7 +135,10 @@ func main() {
 		go warmup(ctx, p, up, cfg.Pool.Warmup.Concurrency)
 	}
 	go pinger(ctx, p, prices, up, cfg)
-	go saver(ctx, p, daily, statePath, &persistDirty)
+	// 请求日志也要落盘：别的路径（号状态、策略）本来就会标脏，
+	// 但纯读请求（/v1/models、失败的 4xx）不改变号池，只写日志 —— 不接这条就永远存不下去。
+	lg.OnAdd = func() { persistDirty.Store(true) }
+	go saver(ctx, p, daily, lg, statePath, &persistDirty)
 
 	go func() {
 		log.Printf("trpool %s 启动：listen=%s upstream=%s 号池=%d 个 client_key=%d 个",
@@ -143,12 +153,12 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
-	saveState(statePath, p, daily)
+	saveState(statePath, p, daily, lg)
 	log.Println("已退出")
 }
 
 // loadState 从磁盘恢复号池与日账。文件损坏时宁可空池启动，也不要带着半个池子跑。
-func loadState(path string, p *pool.Pool, daily *ledger.Daily) {
+func loadState(path string, p *pool.Pool, daily *ledger.Daily, lg *ledger.Log) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -165,11 +175,15 @@ func loadState(path string, p *pool.Pool, daily *ledger.Daily) {
 	if st.Daily != nil && st.Daily.Days != nil {
 		daily.Days = st.Daily.Days
 	}
-	log.Printf("状态已恢复：%d 个号，%d 天账本", len(st.Pool.Keys), len(daily.Days))
+	if len(st.Logs) > 0 {
+		lg.Restore(st.Logs)
+	}
+	log.Printf("状态已恢复：%d 个号，%d 天账本，%d 条历史日志", len(st.Pool.Keys), len(daily.Days), len(st.Logs))
 }
 
-func saveState(path string, p *pool.Pool, daily *ledger.Daily) {
-	st := stateFile{Pool: p.Snapshot(), Daily: daily, Saved: time.Now().Format(time.RFC3339)}
+func saveState(path string, p *pool.Pool, daily *ledger.Daily, lg *ledger.Log) {
+	// 只留最近一批：state.json 每 5 秒就可能重写一次，塞满整个环会让文件无谓变胖
+	st := stateFile{Pool: p.Snapshot(), Daily: daily, Logs: lg.Recent(persistLogs), Saved: time.Now().Format(time.RFC3339)}
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		log.Printf("WARN: 序列化状态失败: %v", err)
@@ -185,7 +199,7 @@ func saveState(path string, p *pool.Pool, daily *ledger.Daily) {
 	}
 }
 
-func saver(ctx context.Context, p *pool.Pool, daily *ledger.Daily, path string, dirty *atomic.Bool) {
+func saver(ctx context.Context, p *pool.Pool, daily *ledger.Daily, lg *ledger.Log, path string, dirty *atomic.Bool) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for {
@@ -194,7 +208,7 @@ func saver(ctx context.Context, p *pool.Pool, daily *ledger.Daily, path string, 
 			return
 		case <-t.C:
 			if dirty.Swap(false) {
-				saveState(path, p, daily)
+				saveState(path, p, daily, lg)
 			}
 		}
 	}

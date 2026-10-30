@@ -306,6 +306,10 @@ type Log struct {
 	size int
 	pos  int
 	full bool
+
+	// OnAdd 在每条新日志写入后调用（持锁外）。它让"日志变了"也能触发落盘——
+	// 否则重启一次日志环清空，排查历史问题就无据可查。
+	OnAdd func()
 }
 
 func NewLog(size int) *Log {
@@ -322,7 +326,25 @@ func (l *Log) Add(e Entry) {
 	if l.pos == 0 {
 		l.full = true
 	}
+	cb := l.OnAdd
 	l.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// Restore 用历史日志回填环。olds 按时间**倒序**（Recent 的输出格式），
+// 这里反着灌，保证灌完再 Recent 出来顺序不变。
+func (l *Log) Restore(olds []Entry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(olds) - 1; i >= 0; i-- {
+		l.buf[l.pos] = olds[i]
+		l.pos = (l.pos + 1) % l.size
+		if l.pos == 0 {
+			l.full = true
+		}
+	}
 }
 
 // Recent 返回最近 n 条，按时间倒序（新的在前）。

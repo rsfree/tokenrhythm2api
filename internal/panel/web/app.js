@@ -671,7 +671,12 @@ function renderLogsTable() {
       </tr>`;
     }).join('');
   }
-  $('logHint').textContent = `最近 ${logs.length} 条 · 匹配 ${rows.length} 条 · 环形缓冲上限 ${(state.data.logging && state.data.logging.ring_size) || '—'}`;
+  // 日志会随状态文件跨重启保留 ⇒ 必须标出进程启动时刻，否则会把上个进程的记录
+  // 当成"刚刚发生的"来读时间线。
+  const startedAt = new Date(Date.now() - (state.data.uptime_seconds || 0) * 1000);
+  const ringSize = (state.data.logging && state.data.logging.ring_size) || '—';
+  $('logHint').textContent =
+    `最近 ${logs.length} 条 · 匹配 ${rows.length} 条 · 环形缓冲上限 ${ringSize} · 本进程启动于 ${mmddhhmm(startedAt.toISOString())}`;
 }
 
 $('logTable').addEventListener('click', (e) => {
