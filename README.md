@@ -28,6 +28,22 @@
 
 ---
 
+## 安装
+
+从 [Releases](https://github.com/rsfree/tokenrhythm2api/releases) 下载对应平台的单文件二进制：
+
+```bash
+# Linux amd64
+curl -fsSL -o trpool https://github.com/rsfree/tokenrhythm2api/releases/latest/download/trpool-linux-amd64
+chmod +x trpool && ./trpool -config config.json
+```
+
+或自行编译（需 Go 1.25+）：
+
+```bash
+go build -o trpool ./cmd/trpool
+```
+
 ## 快速开始
 
 ```bash
