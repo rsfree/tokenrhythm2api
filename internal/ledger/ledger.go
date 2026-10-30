@@ -7,6 +7,7 @@ package ledger
 
 import (
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,6 +112,21 @@ func (p *Prices) Count() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.m)
+}
+
+// Snapshot 返回价目表快照，按模型名排序（map 遍历无序，直接塞给前端会每次刷新都跳）。
+func (p *Prices) Snapshot() []Price {
+	p.mu.RLock()
+	out := make([]Price, 0, len(p.m))
+	for _, v := range p.m {
+		out = append(out, v)
+	}
+	p.mu.RUnlock()
+	// 大小写不敏感：模型名里有 "deepseek-v4-Flash-0731" 这种大写，按 byte 排会把它甩到最前面
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].ID) < strings.ToLower(out[j].ID)
+	})
+	return out
 }
 
 func (p *Prices) UpdatedAt() time.Time {

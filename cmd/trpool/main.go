@@ -104,6 +104,7 @@ func main() {
 
 	pan := panel.New(panel.Deps{
 		Cfg: &cfg, Pool: p, Prices: prices, Log: lg, Daily: daily, Up: up,
+		Version: version,
 		Stats:  h.Stats().Snapshot,
 		Uptime: h.Uptime,
 		Persist: func() {

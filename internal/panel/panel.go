@@ -23,6 +23,7 @@ var webFS embed.FS
 type Deps struct {
 	Cfg     *config.Config
 	Pool    *pool.Pool
+	Version string // 由 cmd 注入，面板上用来确认"线上跑的到底是哪个版本"
 	Prices  *ledger.Prices
 	Log     *ledger.Log
 	Daily   *ledger.Daily
@@ -102,7 +103,12 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	cfg := p.d.Pool.Config()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
+		"version":        p.d.Version,
 		"upstream":       p.d.Up.Base(),
+		"listen":         p.d.Cfg.Listen,
+		"data_dir":       p.d.Cfg.DataDir,
+		"auto_probe":     p.d.Cfg.AutoProbe,
+		"logging":        p.d.Cfg.Logging,
 		"uptime_seconds": int64(p.d.Uptime().Seconds()),
 		"stats":          p.d.Stats(),
 		"keys":           views,
@@ -112,6 +118,8 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		"prices": map[string]any{
 			"count":      p.d.Prices.Count(),
 			"updated_at": p.d.Prices.UpdatedAt().Format(time.RFC3339),
+			// 明细给「模型与档位」页；25 个模型约 4KB，不值得再开一次请求
+			"list": p.d.Prices.Snapshot(),
 		},
 		"totals": map[string]any{
 			"requests": totalReq, "errors": totalErr,
@@ -288,6 +296,15 @@ func (p *Panel) handlePool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Panel) handlePrices(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"count":      p.d.Prices.Count(),
+			"updated_at": p.d.Prices.UpdatedAt().Format(time.RFC3339),
+			"list":       p.d.Prices.Snapshot(),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
 		return
