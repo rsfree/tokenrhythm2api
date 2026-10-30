@@ -69,12 +69,26 @@ TRPOOL_KEYS="账号A=sk_tr_xxx=100,账号B=sk_tr_yyy=50" ./trpool -config config
 #                                     ↑ 名称=密钥=充值额（¥，可省）
 ```
 
-Docker：
+Docker（自己构建）：
 
 ```bash
 export TRPOOL_ADMIN_KEY=... TRPOOL_CLIENT_KEYS=...
 docker compose up -d
 ```
+
+或用 CI 出的镜像：
+
+```bash
+docker run -d --name trpool --restart unless-stopped \
+  -p 8787:8787 \
+  -e TRPOOL_ADMIN_KEY="sk-trpadmin-..." \
+  -e TRPOOL_CLIENT_KEYS="sk-trpool-..." \
+  -v "$PWD/data:/data/data" \
+  ghcr.io/rsfree/tokenrhythm2api:latest
+```
+
+> 镜像 tag 与 git tag 同版本但**不带 `v` 前缀**（`v0.0.3` → `:0.0.3`），另有 `:latest` 和 `:sha-<7位>`。
+> 若包是 private，先 `echo $TOKEN | docker login ghcr.io -u <user> --password-stdin`。
 
 ---
 

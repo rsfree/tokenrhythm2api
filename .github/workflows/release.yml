@@ -16,6 +16,8 @@ jobs:
   release:
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.next }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,3 +133,66 @@ jobs:
           name: dist-${{ steps.ver.outputs.next }}
           path: dist/
           retention-days: 30
+
+  image:
+    # 发版成功才推镜像；逃生阀跳过 release 时这里会自动级联跳过
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          V='${{ needs.release.outputs.version }}'
+          V="${V#v}"          # git tag 带 v，镜像 tag 不带
+          echo "value=${V}" >> "$GITHUB_OUTPUT"
+          echo "image tag: ${V}"
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg VERSION='${{ needs.release.outputs.version }}' \
+            -t "${IMAGE}:${{ steps.tag.outputs.value }}" .
+
+      - name: Smoke test before push
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE}:${{ steps.tag.outputs.value }}"
+          docker run -d --name smoke -p 18087:8787 \
+            -e TRPOOL_ADMIN_KEY=smoke-admin \
+            -e TRPOOL_CLIENT_KEYS=sk-trpool-smoke "$IMG"
+          trap 'docker logs smoke || true; docker rm -f smoke || true' EXIT
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18087/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = "1" ] || { echo "::error::/healthz 未在 40s 内就绪"; exit 1; }
+          curl -fsS http://127.0.0.1:18087/healthz
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18087/v1/models)
+          [ "$code" = "401" ] || { echo "::error::无密钥应为 401，实际 $code"; exit 1; }
+          echo "smoke passed"
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          V='${{ steps.tag.outputs.value }}'
+          SHA=$(printf '%s' '${{ github.sha }}' | cut -c1-7)
+          for t in "${IMAGE}:${V}" "${IMAGE}:latest" "${IMAGE}:sha-${SHA}"; do
+            echo "pushing $t"
+            docker push "$t" 2>&1 | tee -a /tmp/push.log
+          done
+          # 同一次构建推三个 tag，digest 必须唯一
+          n=$(grep -o 'digest: sha256:[a-f0-9]*' /tmp/push.log | sort -u | wc -l)
+          echo "distinct digests: $n"
+          [ "$n" = "1" ] || { echo "::error::三个 tag 的 digest 不一致"; exit 1; }
+          grep -o 'digest: sha256:[a-f0-9]*' /tmp/push.log | sort -u

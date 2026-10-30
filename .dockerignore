@@ -1,0 +1,12 @@
+# build context 里绝不能出现的东西
+.git
+.gitignore
+data
+config.json
+.workbuddy
+*.log
+.DS_Store
+/trpool
+README.md
+LICENSE
+docker-compose.yml
