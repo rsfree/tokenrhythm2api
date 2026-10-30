@@ -85,6 +85,8 @@ html, body {
   color: var(--muted);
 }
 .sig-row { display: flex; align-items: center; gap: 6px; }
+/* 版本 + 上游域名可能比侧栏宽：单行截断，别让它换行把签名区顶高 */
+#navVer { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
 .sig-row + .sig-row { margin-top: 4px; }
 .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-weak); }
 .pulse.bad { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-weak); }

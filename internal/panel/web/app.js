@@ -261,6 +261,7 @@ function renderChrome(d) {
   $('upstreamTag') && ($('upstreamTag').textContent = d.upstream || '');
   $('uptime').textContent = '运行 ' + fmtDur(d.uptime_seconds || 0);
   $('navVer').textContent = (d.version || 'dev') + ' · ' + (d.upstream || '').replace(/^https?:\/\//, '');
+  $('navVer').title = $('navVer').textContent;
   setNavState(true, '已连接');
 }
 
@@ -326,7 +327,9 @@ function renderErrFeed(d) {
   const bad = (d.logs || []).filter((l) => l.error || (l.status >= 400)).slice(0, 8);
   if (!bad.length) {
     // 说清窗口：累计失败数可能是历史账本里的，日志环只覆盖最近若干条
-    $('errFeed').innerHTML = `<div class="empty">最近 ${scanned} 条请求里没有失败 👍</div>`;
+    $('errFeed').innerHTML = scanned
+      ? `<div class="empty">最近 ${scanned} 条请求里没有失败 👍</div>`
+      : '<div class="empty">重启后还没有新请求（历史失败计入账本，但不进日志环）</div>';
     return;
   }
   $('errFeed').innerHTML = bad.map((l) => `
