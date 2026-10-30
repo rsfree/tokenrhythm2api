@@ -144,6 +144,17 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 	return res, nil
 }
 
+// StatusError 是上游返回非 2xx 时的结构化错误。
+// 调用方（预热、探活）需要按状态码决定怎么处理这个号，不能只看一句字符串。
+type StatusError struct {
+	Status int
+	Body   []byte
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("上游返回 %d: %s", e.Status, snippet(e.Body))
+}
+
 // FetchModels 用某个号拉一次价目表。
 func (c *Client) FetchModels(ctx context.Context, secret string) ([]byte, error) {
 	res, err := c.Do(ctx, http.MethodGet, "/v1/models", nil, secret, http.Header{}, false, false)
@@ -151,7 +162,7 @@ func (c *Client) FetchModels(ctx context.Context, secret string) ([]byte, error)
 		return nil, err
 	}
 	if res.Status != http.StatusOK {
-		return nil, fmt.Errorf("上游返回 %d: %s", res.Status, snippet(res.Body))
+		return nil, &StatusError{Status: res.Status, Body: res.Body}
 	}
 	return res.Body, nil
 }

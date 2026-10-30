@@ -107,6 +107,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		"stats":          p.d.Stats(),
 		"keys":           views,
 		"pool":           cfg,
+		"batch":          p.d.Pool.BatchState(),
 		"client_keys":    p.d.Cfg.ClientKeys,
 		"prices": map[string]any{
 			"count":      p.d.Prices.Count(),
@@ -291,31 +292,35 @@ func (p *Panel) handlePrices(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
 		return
 	}
-	secret := ""
-	if v := p.d.Pool.Views(); len(v) > 0 {
-		for _, k := range v {
-			if k.Enabled && k.State == "active" {
-				if s, ok := p.d.Pool.SecretOf(k.ID); ok {
-					secret = s
-					break
-				}
-			}
+	// 逐个号试：某个号被冻结/限流不该让整张价目表刷不出来。
+	var lastErr error
+	tried := 0
+	for _, k := range p.d.Pool.Views() {
+		if !k.Enabled || k.State == "invalid" || k.State == "disabled" {
+			continue
 		}
+		secret, ok := p.d.Pool.SecretOf(k.ID)
+		if !ok {
+			continue
+		}
+		tried++
+		body, err := p.d.Up.FetchModels(r.Context(), secret)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := p.d.Prices.Load(body); err != nil {
+			lastErr = err
+			continue
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": p.d.Prices.Count(), "via": k.Name})
+		return
 	}
-	if secret == "" {
+	if tried == 0 {
 		writeErr(w, http.StatusBadRequest, "池内没有可用号，无法拉取价目表")
 		return
 	}
-	body, err := p.d.Up.FetchModels(r.Context(), secret)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if err := p.d.Prices.Load(body); err != nil {
-		writeErr(w, http.StatusBadGateway, "解析价目表失败: "+err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": p.d.Prices.Count()})
+	writeErr(w, http.StatusBadGateway, "所有号都拉不到价目表: "+lastErr.Error())
 }
 
 func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {

@@ -103,6 +103,25 @@ func (k *Key) Masked() string {
 	return s[:10] + "..." + s[len(s)-4:]
 }
 
+// PickRequest 描述一次选号的上下文。四个粘性层级从强到弱：
+// 视频任务 > 会话 > batch 成员 > 全池。
+type PickRequest struct {
+	Model string
+	// Paid 表示该模型收费；收费模型会被余额保底拦截。
+	Paid bool
+	// Tried 是本次请求已经试过的号，换号重试时不能重复挑。
+	Tried map[string]bool
+	// StickyKeyID 是视频异步任务的创建者，查询必须回到它（即使正在冷却）。
+	StickyKeyID string
+	// SessionKey 是会话指纹，用于命中上游 prompt cache；0 表示不启用。
+	SessionKey uint64
+}
+
+type sessionEntry struct {
+	KeyID string    `json:"key_id"`
+	At    time.Time `json:"at"`
+}
+
 // Lease 是一次选号的结果。Release 必须调用，否则在途计数会永久泄漏。
 type Lease struct {
 	KeyID  string
@@ -121,7 +140,11 @@ type Pool struct {
 	rr            int
 	totalInflight int
 
-	sticky   map[string]stickyEntry
+	sticky map[string]stickyEntry
+	// sessions 是会话指纹 → 号的粘性表（保 prompt cache）。
+	sessions map[uint64]sessionEntry
+	// batch 是当前"活跃使用"的号集合，按权重从高到低维护。
+	batch    []string
 	onChange func()
 }
 
@@ -134,9 +157,10 @@ var ErrNoKey = errors.New("池内无可用密钥")
 
 func New(cfg config.PoolConfig) *Pool {
 	return &Pool{
-		keys:   map[string]*Key{},
-		cfg:    cfg,
-		sticky: map[string]stickyEntry{},
+		keys:     map[string]*Key{},
+		cfg:      cfg,
+		sticky:   map[string]stickyEntry{},
+		sessions: map[uint64]sessionEntry{},
 	}
 }
 
@@ -304,19 +328,22 @@ func (p *Pool) inflightFull(k *Key) bool {
 	return p.cfg.MaxInFlight > 0 && k.inflight >= p.cfg.MaxInFlight
 }
 
-// Acquire 选一个号并占用一个在途名额。
-// modelPaid 决定是否触发余额保底（免费模型不拦）。
-func (p *Pool) Acquire(model string, modelPaid bool, tried map[string]bool, stickyKeyID string) (*Lease, error) {
+// Acquire 是唯一的选号入口。优先级从强到弱：
+//
+//	① 视频任务粘性 —— 上游只认创建者，冷却中也要回原号
+//	② 会话粘性     —— 命中就直接回，这是吃到上游 prompt cache 的唯一办法
+//	③ batch 成员   —— 只从"当前活跃"的号里选（软约束，全不可用会自动放宽）
+//	④ 在途最少     —— 并发高峰把新请求推给空闲的号
+//	⑤ 权重         —— 余额因子 × 闲置补偿
+func (p *Pool) Acquire(req PickRequest) (*Lease, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	// 粘性优先：视频查询必须回到原号，冷却中也要试——上游只认创建者。
-	if stickyKeyID != "" {
-		if k := p.keys[stickyKeyID]; k != nil && k.Enabled {
-			k.inflight++
-			p.totalInflight++
-			return &Lease{KeyID: k.ID, Secret: k.Secret, Name: k.Name}, nil
+	// ① 视频任务粘性
+	if req.StickyKeyID != "" {
+		if k := p.keys[req.StickyKeyID]; k != nil && k.Enabled {
+			return p.leaseLocked(k, now), nil
 		}
 	}
 
@@ -324,17 +351,13 @@ func (p *Pool) Acquire(model string, modelPaid bool, tried map[string]bool, stic
 		return nil, fmt.Errorf("全局在途已满（%d），请稍后重试", p.cfg.MaxInFlightGlobal)
 	}
 
-	cands := make([]*Key, 0, len(p.keys))
-	for _, id := range p.order {
-		k := p.keys[id]
-		if k == nil || tried[id] || !p.usable(k, now) || p.inflightFull(k) {
-			continue
-		}
-		if modelPaid && p.cfg.CreditFloor > 0 && k.Budget > 0 && k.Balance() < p.cfg.CreditFloor {
-			continue // 余额触底，不再派收费模型
-		}
-		cands = append(cands, k)
+	// ② 会话粘性
+	if k := p.sessionHitLocked(req, now); k != nil {
+		return p.leaseLocked(k, now), nil
 	}
+
+	// ③④⑤
+	cands := p.candidatesLocked(req, now)
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("%w（%s）", ErrNoKey, p.blockReasonLocked(now))
 	}
@@ -342,7 +365,7 @@ func (p *Pool) Acquire(model string, modelPaid bool, tried map[string]bool, stic
 	var chosen *Key
 	switch p.cfg.Strategy {
 	case "sequential":
-		chosen = cands[0]
+		chosen = p.leastInflightLocked(cands, now)
 	case "round_robin":
 		chosen = cands[p.rr%len(cands)]
 		p.rr++
@@ -352,10 +375,227 @@ func (p *Pool) Acquire(model string, modelPaid bool, tried map[string]bool, stic
 	if chosen == nil {
 		return nil, ErrNoKey
 	}
-	chosen.inflight++
-	chosen.LastUsedAt = now
+
+	p.noteSessionLocked(req.SessionKey, chosen.ID, now)
+	return p.leaseLocked(chosen, now), nil
+}
+
+func (p *Pool) leaseLocked(k *Key, now time.Time) *Lease {
+	k.inflight++
+	k.LastUsedAt = now
 	p.totalInflight++
-	return &Lease{KeyID: chosen.ID, Secret: chosen.Secret, Name: chosen.Name}, nil
+	return &Lease{KeyID: k.ID, Secret: k.Secret, Name: k.Name}
+}
+
+// sessionHitLocked 命中会话粘性且该号此刻可用，就返回它。
+// 任何一条不满足都返回 nil，退回常规选号——粘性不该成为可用性的阻碍。
+func (p *Pool) sessionHitLocked(req PickRequest, now time.Time) *Key {
+	if req.SessionKey == 0 || !p.cfg.SessionSticky.Enabled {
+		return nil
+	}
+	e, ok := p.sessions[req.SessionKey]
+	if !ok {
+		return nil
+	}
+	if ttl := p.cfg.SessionSticky.TTL.Duration(); ttl > 0 && now.Sub(e.At) > ttl {
+		return nil
+	}
+	k := p.keys[e.KeyID]
+	if k == nil || req.Tried[k.ID] || !p.usable(k, now) || p.inflightFull(k) || p.floorBlocked(k, req.Paid) {
+		return nil
+	}
+	return k
+}
+
+func (p *Pool) noteSessionLocked(key uint64, keyID string, now time.Time) {
+	if key == 0 || keyID == "" || !p.cfg.SessionSticky.Enabled {
+		return
+	}
+	if max := p.cfg.SessionSticky.MaxEntries; max > 0 && len(p.sessions) >= max {
+		// 淘汰最久未使用的，代价是 O(n) 扫描；表很小且只在满时才走。
+		var oldestKey uint64
+		var oldestAt time.Time
+		for k, v := range p.sessions {
+			if oldestAt.IsZero() || v.At.Before(oldestAt) {
+				oldestKey, oldestAt = k, v.At
+			}
+		}
+		delete(p.sessions, oldestKey)
+	}
+	p.sessions[key] = sessionEntry{KeyID: keyID, At: now}
+}
+
+// floorBlocked 判断余额是否已触底到不该再派收费模型。
+func (p *Pool) floorBlocked(k *Key, paid bool) bool {
+	if !paid || p.cfg.CreditFloor <= 0 || k.Budget <= 0 {
+		return false
+	}
+	return k.Balance() < p.cfg.CreditFloor
+}
+
+// candidatesLocked 先做硬过滤，再套 batch 软约束。
+func (p *Pool) candidatesLocked(req PickRequest, now time.Time) []*Key {
+	all := make([]*Key, 0, len(p.keys))
+	for _, id := range p.order {
+		k := p.keys[id]
+		if k == nil || req.Tried[id] || !p.usable(k, now) || p.inflightFull(k) {
+			continue
+		}
+		if p.floorBlocked(k, req.Paid) {
+			continue
+		}
+		all = append(all, k)
+	}
+	if len(all) == 0 {
+		return nil
+	}
+
+	target, on := p.batchTargetLocked()
+	if !on {
+		return all
+	}
+	p.syncBatchLocked(target, now)
+	if len(p.batch) == 0 {
+		return all
+	}
+	in := make([]*Key, 0, len(p.batch))
+	for _, id := range p.batch {
+		for _, k := range all {
+			if k.ID == id {
+				in = append(in, k)
+				break
+			}
+		}
+	}
+	if len(in) > 0 {
+		return in
+	}
+	// batch 内的号这一轮全满（或被 tried 排除）→ 放开到全池。
+	// 宁可突破 batch 也别把请求卡死。
+	return all
+}
+
+// batchTargetLocked 算出"现在该同时用几个号"。
+func (p *Pool) batchTargetLocked() (int, bool) {
+	mode := p.cfg.Batch.Mode
+	if mode == "" || mode == "off" || len(p.keys) == 0 {
+		return 0, false
+	}
+	n := len(p.keys)
+	minS, maxS := p.cfg.Batch.Min, p.cfg.Batch.Max
+	if minS <= 0 {
+		minS = 1
+	}
+	if minS > n {
+		minS = n
+	}
+	if maxS <= 0 || maxS > n {
+		maxS = n
+	}
+	if maxS < minS {
+		maxS = minS
+	}
+
+	switch mode {
+	case "fixed":
+		return clampInt(p.cfg.Batch.Size, minS, maxS), true
+	default: // auto
+		per := p.cfg.Batch.TargetInflightPerKey
+		if per <= 0 {
+			per = 4
+		}
+		need := (p.totalInflight + per - 1) / per
+		return clampInt(need, minS, maxS), true
+	}
+}
+
+// syncBatchLocked 把 batch 向目标大小收敛。
+// 扩容：按权重从高到低补；缩容：只淘汰空闲号，正在跑请求的等它跑完再说。
+func (p *Pool) syncBatchLocked(target int, now time.Time) {
+	alive := make([]string, 0, len(p.batch))
+	for _, id := range p.batch {
+		if k := p.keys[id]; k != nil && p.usable(k, now) {
+			alive = append(alive, id)
+		}
+	}
+	p.batch = alive
+
+	if len(p.batch) < target {
+		in := make(map[string]bool, len(p.batch))
+		for _, id := range p.batch {
+			in[id] = true
+		}
+		type cand struct {
+			id string
+			w  float64
+		}
+		cs := make([]cand, 0, len(p.order))
+		for _, id := range p.order {
+			k := p.keys[id]
+			if k == nil || in[id] || !p.usable(k, now) {
+				continue
+			}
+			cs = append(cs, cand{id, p.weightOf(k, now)})
+		}
+		sort.Slice(cs, func(i, j int) bool { return cs[i].w > cs[j].w })
+		for _, c := range cs {
+			if len(p.batch) >= target {
+				break
+			}
+			p.batch = append(p.batch, c.id)
+		}
+		return
+	}
+
+	excess := len(p.batch) - target
+	if excess <= 0 {
+		return
+	}
+	keep := make([]string, 0, len(p.batch))
+	for i := len(p.batch) - 1; i >= 0; i-- {
+		id := p.batch[i]
+		if excess > 0 {
+			if k := p.keys[id]; k != nil && k.inflight == 0 {
+				excess--
+				continue
+			}
+		}
+		keep = append(keep, id)
+	}
+	for i, j := 0, len(keep)-1; i < j; i, j = i+1, j-1 {
+		keep[i], keep[j] = keep[j], keep[i]
+	}
+	p.batch = keep
+}
+
+// leastInflightLocked 取在途最少的号，并列时按权重抽，避免总压同一个。
+func (p *Pool) leastInflightLocked(cands []*Key, now time.Time) *Key {
+	best := cands[0].inflight
+	for _, k := range cands[1:] {
+		if k.inflight < best {
+			best = k.inflight
+		}
+	}
+	tier := make([]*Key, 0, len(cands))
+	for _, k := range cands {
+		if k.inflight == best {
+			tier = append(tier, k)
+		}
+	}
+	if len(tier) == 1 {
+		return tier[0]
+	}
+	return p.weightedLocked(tier, now)
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // weightedLocked 实现「top-K 短名单 + 加权抽签」：先按权重降序截断，
@@ -417,6 +657,10 @@ func (p *Pool) weightOf(k *Key, now time.Time) float64 {
 			gain := math.Min(idle*p.cfg.IdleWeightPerHour, p.cfg.IdleWeightMax)
 			w *= 1 + gain
 		}
+	}
+	// 在途惩罚：并发高峰时把新请求推向空闲的号，而不是继续压满的号。
+	if p.cfg.LeastInflight && k.inflight > 0 {
+		w /= 1 + float64(k.inflight)*p.cfg.InflightPenalty
 	}
 	return w
 }
@@ -515,6 +759,22 @@ func (p *Pool) applyFailLocked(k *Key, kind FailKind, now time.Time) {
 	}
 }
 
+// MarkFail 供预热/探活这类"没走选号"的路径使用：把结论落成号的状态。
+// 没有它，预热就只是打了个日志，第一波业务请求照样要自己试错一遍。
+func (p *Pool) MarkFail(id string, kind FailKind, msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := p.keys[id]
+	if k == nil {
+		return
+	}
+	k.Errors++
+	k.LastError = truncate(msg, 240)
+	k.LastErrorAt = time.Now()
+	p.applyFailLocked(k, kind, time.Now())
+	p.notify()
+}
+
 // Tick 把自然到期的冷却号拉回 active，并清理过期粘性。
 func (p *Pool) Tick() {
 	p.mu.Lock()
@@ -539,6 +799,13 @@ func (p *Pool) Tick() {
 			if now.Sub(s.At) > ttl {
 				delete(p.sticky, tid)
 				changed = true
+			}
+		}
+	}
+	if st := p.cfg.SessionSticky.TTL.Duration(); st > 0 {
+		for key, e := range p.sessions {
+			if now.Sub(e.At) > st {
+				delete(p.sessions, key)
 			}
 		}
 	}
@@ -656,6 +923,10 @@ func (p *Pool) Restore(s Snapshot) {
 	if len(s.Sticky) > 0 {
 		p.sticky = s.Sticky
 	}
+	// 会话粘性与 batch 是运行时状态，重启即重建：
+	// 会话已经断了，硬留着只会把新对话指到不该指的号上。
+	p.sessions = map[uint64]sessionEntry{}
+	p.batch = nil
 }
 
 // ---------- 面板视图 ----------
@@ -683,6 +954,8 @@ type View struct {
 	StickyTasks      int     `json:"sticky_tasks"`
 	Share            float64 `json:"share"` // 消耗占比 0..1
 	WeightNow        float64 `json:"weight_now"`
+	InBatch          bool    `json:"in_batch"`
+	Sessions         int     `json:"sessions"`
 }
 
 func (p *Pool) Views() []View {
@@ -692,6 +965,14 @@ func (p *Pool) Views() []View {
 	var totalSpent float64
 	for _, k := range p.keys {
 		totalSpent += k.SpentCNY
+	}
+	inBatch := make(map[string]bool, len(p.batch))
+	for _, id := range p.batch {
+		inBatch[id] = true
+	}
+	sessByKey := make(map[string]int, len(p.keys))
+	for _, e := range p.sessions {
+		sessByKey[e.KeyID]++
 	}
 	out := make([]View, 0, len(p.order))
 	for _, id := range p.order {
@@ -707,6 +988,7 @@ func (p *Pool) Views() []View {
 			PromptTokens: k.PromptTokens, CompletionTokens: k.CompletionTokens,
 			FailStreak: k.FailStreak, LastError: k.LastError,
 			Inflight: k.inflight, WeightNow: p.weightOf(k, now),
+			InBatch: inBatch[id], Sessions: sessByKey[id],
 		}
 		if k.Budget > 0 && totalSpent > 0 {
 			v.Share = k.SpentCNY / totalSpent
@@ -732,6 +1014,32 @@ func (p *Pool) Views() []View {
 		out = append(out, v)
 	}
 	return out
+}
+
+// BatchState 是调度面板要看的"当前用了几个号"。
+type BatchState struct {
+	Mode          string   `json:"mode"`
+	Target        int      `json:"target"`
+	Size          int      `json:"size"`
+	Members       []string `json:"members"`
+	TotalInflight int      `json:"total_inflight"`
+	Sessions      int      `json:"sessions"`
+}
+
+func (p *Pool) BatchState() BatchState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	st := BatchState{
+		Mode:          p.cfg.Batch.Mode,
+		Size:          len(p.batch),
+		Members:       append([]string(nil), p.batch...),
+		TotalInflight: p.totalInflight,
+		Sessions:      len(p.sessions),
+	}
+	if t, ok := p.batchTargetLocked(); ok {
+		st.Target = t
+	}
+	return st
 }
 
 func (p *Pool) Has(id string) bool {

@@ -40,6 +40,7 @@
         <div class="card-label">可用号 / 总数</div>
         <div class="card-value"><span id="kHealthy">0</span><small> / <span id="kTotal">0</span></small></div>
         <div class="card-sub" id="kStates">—</div>
+        <div class="card-sub" id="kBatch">—</div>
       </div>
       <div class="card">
         <div class="card-label">请求总数</div>
@@ -116,6 +117,23 @@
         <label>闲置权重 / 小时<input type="number" id="pIdle" step="0.1" min="0"></label>
         <label>429 冷却（秒）<input type="number" id="pRate" min="1"></label>
         <label>熔断冷却（秒）<input type="number" id="pBreaker" min="1"></label>
+        <label>在途惩罚系数<input type="number" id="pInflight" step="0.5" min="0"></label>
+        <label>会话粘性
+          <select id="pSticky">
+            <option value="1">开启（保 prompt cache）</option>
+            <option value="0">关闭（纯分摊）</option>
+          </select>
+        </label>
+        <label>粘性 TTL（分钟）<input type="number" id="pStickyTtl" min="1"></label>
+        <label>Batch 模式
+          <select id="pBatchMode">
+            <option value="off">off · 全池平分</option>
+            <option value="auto">auto · 按并发放大</option>
+            <option value="fixed">fixed · 固定个数</option>
+          </select>
+        </label>
+        <label>Batch 固定个数<input type="number" id="pBatchSize" min="1"></label>
+        <label>每号承载在途<input type="number" id="pBatchPer" min="1"></label>
       </div>
       <p class="hint" id="priceHint">价目表：—</p>
     </section>

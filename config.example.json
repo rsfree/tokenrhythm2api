@@ -22,7 +22,28 @@
     "retry_max": 3,
     "upstream_timeout": "300s",
     "video_timeout": "600s",
-    "sticky_ttl": "72h"
+    "sticky_ttl": "72h",
+    "least_inflight": true,
+    "inflight_penalty": 3,
+    "session_sticky": {
+      "enabled": true,
+      "ttl": "30m",
+      "max_entries": 2000,
+      "prefix_affinity": true
+    },
+    "batch": {
+      "mode": "auto",
+      "size": 3,
+      "min": 1,
+      "max": 0,
+      "target_inflight_per_key": 4
+    },
+    "warmup": {
+      "enabled": true,
+      "on_start": true,
+      "interval": "0s",
+      "concurrency": 4
+    }
   },
   "logging": {
     "ring_size": 400,

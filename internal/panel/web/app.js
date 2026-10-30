@@ -42,14 +42,20 @@ function hhmmss(iso) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+// 兼容 Go 的 Duration.String()，它会输出 "30m0s" / "1h30m0s" 这种多段形式。
 function parseDur(s) {
   if (typeof s === 'number') return s;
   if (!s) return 0;
-  const m = String(s).match(/^([\d.]+)(ns|us|µs|ms|s|m|h)$/);
-  if (!m) return Number(s) || 0;
-  const v = parseFloat(m[1]);
-  const unit = { ns: 1e-9, us: 1e-6, 'µs': 1e-6, ms: 1e-3, s: 1, m: 60, h: 3600 }[m[2]] || 1;
-  return Math.round(v * unit * 1000) / 1000;
+  const str = String(s).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) return parseFloat(str);
+  const unit = { ns: 1e-9, us: 1e-6, 'µs': 1e-6, ms: 1e-3, s: 1, m: 60, h: 3600 };
+  const re = /(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g;
+  let total = 0, m, found = false;
+  while ((m = re.exec(str)) !== null) {
+    total += parseFloat(m[1]) * (unit[m[2]] || 1);
+    found = true;
+  }
+  return found ? Math.round(total * 1000) / 1000 : 0;
 }
 
 function fmtDur(sec) {
@@ -167,8 +173,12 @@ function renderKeys(keys) {
       ? `<div class="err-line" title="${esc(k.last_error)}">${esc(k.last_error.slice(0, 30))}${k.last_error.length > 30 ? '…' : ''}</div>`
       : '';
     const toggleText = k.enabled ? '停用' : '启用';
+    const pills = [
+      k.in_batch ? '<span class="pill on" title="当前 batch 成员">B</span>' : '',
+      k.sessions > 0 ? `<span class="pill sess" title="${k.sessions} 个会话粘在此号">${k.sessions}</span>` : '',
+    ].join('');
     return `<tr data-id="${esc(k.id)}">
-      <td><div class="name-cell">${esc(k.name)}</div><div class="mask">${esc(k.masked)}</div>${errLine}</td>
+      <td><div class="name-cell">${esc(k.name)}${pills}</div><div class="mask">${esc(k.masked)}</div>${errLine}</td>
       <td>${stateBadge(k)}</td>
       <td>${balanceCell(k)}</td>
       <td class="num">${compact(k.requests)}</td>
@@ -232,6 +242,13 @@ function renderState(d) {
     ? Object.entries(counts).map(([k, v]) => `${STATE_TEXT[k] || k} ${v}`).join(' · ')
     : '还没有号';
 
+  const b = d.batch || {};
+  const sessN = b.sessions || 0;
+  const infl = b.total_inflight || 0;
+  $('kBatch').textContent = (b.mode && b.mode !== 'off')
+    ? `batch ${b.size}/${b.target} · 会话 ${sessN} · 在途 ${infl}`
+    : `全池平分 · 会话 ${sessN} · 在途 ${infl}`;
+
   const today = (d.days && d.days[0]) ? d.days[0] : null;
   $('kTodayCost').textContent = money(today ? today.cost : 0);
   $('kTodayReq').textContent = today ? `${today.requests} 次请求` : '暂无数据';
@@ -274,6 +291,14 @@ function renderPoolForm(p) {
   $('pIdle').value = p.idle_weight_per_hour ?? 0;
   $('pRate').value = Math.round(parseDur(p.rate_cooldown));
   $('pBreaker').value = Math.round(parseDur(p.breaker_cooldown));
+  $('pInflight').value = p.inflight_penalty ?? 3;
+  const ss = p.session_sticky || {};
+  $('pSticky').value = ss.enabled ? '1' : '0';
+  $('pStickyTtl').value = Math.max(1, Math.round(parseDur(ss.ttl) / 60) || 30);
+  const bt = p.batch || {};
+  $('pBatchMode').value = bt.mode || 'auto';
+  $('pBatchSize').value = bt.size ?? 3;
+  $('pBatchPer').value = bt.target_inflight_per_key ?? 4;
 }
 
 async function refresh() {
@@ -363,7 +388,10 @@ $('keyTable').addEventListener('click', async (e) => {
 });
 
 $('btnSavePool').addEventListener('click', async () => {
+  // 必须以服务端现有配置为底再覆盖：只发改动的字段，其余会被后端当成零值写回去。
+  const base = (state.data && state.data.pool) || {};
   const payload = {
+    ...base,
     strategy: $('pStrategy').value,
     top_k: parseInt($('pTopK').value, 10) || 5,
     max_in_flight: parseInt($('pMaxInflight').value, 10) || 0,
@@ -372,6 +400,18 @@ $('btnSavePool').addEventListener('click', async () => {
     idle_weight_per_hour: parseFloat($('pIdle').value) || 0,
     rate_cooldown: Math.round(parseFloat($('pRate').value) || 20) + 's',
     breaker_cooldown: Math.round(parseFloat($('pBreaker').value) || 30) + 's',
+    inflight_penalty: parseFloat($('pInflight').value) || 3,
+    session_sticky: {
+      ...(base.session_sticky || {}),
+      enabled: $('pSticky').value === '1',
+      ttl: Math.max(1, parseInt($('pStickyTtl').value, 10) || 30) + 'm',
+    },
+    batch: {
+      ...(base.batch || {}),
+      mode: $('pBatchMode').value,
+      size: parseInt($('pBatchSize').value, 10) || 3,
+      target_inflight_per_key: parseInt($('pBatchPer').value, 10) || 4,
+    },
   };
   try {
     await api('/panel/api/pool', { method: 'PUT', body: JSON.stringify(payload) });

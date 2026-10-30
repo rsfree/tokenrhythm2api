@@ -146,6 +146,8 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	model := meta.Model
 	paid := h.prices.Paid(model)
+	// 会话指纹只对"有对话内容"的请求有意义；/v1/models 这类没有 body 的自然算不出来。
+	sessKey := sessionKey(body, h.cfg.Pool.SessionSticky.PrefixAffinity)
 
 	tried := map[string]bool{}
 	maxAttempts := h.cfg.Pool.RetryMax
@@ -159,7 +161,13 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var lastErr string
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		lease, err := h.pool.Acquire(model, paid, tried, stickyKey)
+		lease, err := h.pool.Acquire(pool.PickRequest{
+			Model:       model,
+			Paid:        paid,
+			Tried:       tried,
+			StickyKeyID: stickyKey,
+			SessionKey:  sessKey,
+		})
 		if err != nil {
 			// 已经有上游错误时保留它：把上游的 500 改写成网关的 503，
 			// 会让排障的人以为是网关容量问题，实际是上游在炸。
@@ -414,8 +422,19 @@ func classify(status int, body []byte) pool.FailKind {
 	case status == http.StatusTooManyRequests:
 		return pool.FailRate
 	case status == http.StatusForbidden:
-		// 文档写明 403 = 未获灰度权限，属于"这个模型不让你调"，不是号的锅。
-		return pool.FailClient
+		// 403 是同一个状态码、三种完全不同的意思，必须看 body 才能判：
+		//   ACCOUNT_SUSPENDED   账号被临时冻结 → 是这个号的问题，冷却+换号
+		//   MODEL_ACCESS_DENIED 模型未开通/未灰度 → 换哪个号都一样，直接回客户端
+		//   其它                认不出来 → 冷却久一点，别反复撞
+		switch {
+		case bytes.Contains(body, []byte("ACCOUNT_SUSPENDED")):
+			return pool.FailRate
+		case bytes.Contains(body, []byte("MODEL_ACCESS_DENIED")),
+			bytes.Contains(body, []byte("灰度")):
+			return pool.FailClient
+		default:
+			return pool.FailQuota
+		}
 	case status >= 500:
 		return pool.FailUpstream
 	case status >= 400:

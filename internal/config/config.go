@@ -35,6 +35,41 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + time.Duration(d).String() + `"`), nil
 }
 
+// SessionSticky 让同一段对话尽量落在同一个号上。
+// 目的不是"均衡"，而是**命中上游 prompt cache**：多数模型服务商的缓存按账号隔离，
+// 会话一散就永远命中不了，而缓存价通常只有输入价的 1/3 ~ 1/5。
+type SessionSticky struct {
+	Enabled bool     `json:"enabled"`
+	TTL     Duration `json:"ttl"`
+	// 表大小上限，防止长跑后内存无界增长；超出后淘汰最久未用的。
+	MaxEntries int `json:"max_entries"`
+	// PrefixAffinity 指用 system + 首条 user 做指纹（同一人格的连续对话更容易命中），
+	// 关掉则只看显式会话标识（OpenAI 的 user / Anthropic 的 metadata.user_id）。
+	PrefixAffinity bool `json:"prefix_affinity"`
+}
+
+// Batch 控制"同时只用几个号"。
+// off=全池参与（最均衡）；fixed=固定 N 个；auto=按在途并发自动伸缩。
+// 集中使用少数号能让每个号更快"用透"，代价是余量变薄。
+type Batch struct {
+	Mode string `json:"mode"`
+	Size int    `json:"size"`
+	Min  int    `json:"min"`
+	Max  int    `json:"max"` // 0 = 不限（等于池大小）
+	// auto 的换算基准：每多少在途请求扩一个号
+	TargetInflightPerKey int `json:"target_inflight_per_key"`
+}
+
+// Warmup 启动预热与保活。
+// 预热的价值不在"模型冷启动"（上游是 API 网关），而在于启动后立刻掌握每个号
+// 的真实可用性，别让第一波业务请求去试错；顺带把到上游的 TLS 连接建起来。
+type Warmup struct {
+	Enabled     bool     `json:"enabled"`
+	OnStart     bool     `json:"on_start"`
+	Interval    Duration `json:"interval"` // 0 = 不做周期保活
+	Concurrency int      `json:"concurrency"`
+}
+
 // PoolConfig 是选号与容错的全部旋钮。
 type PoolConfig struct {
 	// Strategy: weighted_random | round_robin | sequential
@@ -74,6 +109,14 @@ type PoolConfig struct {
 
 	// 视频任务 ID → key 的粘性保留时长
 	StickyTTL Duration `json:"sticky_ttl"`
+
+	// 在途感知：把在途数折进权重，避免并发高峰全压在一个号上。
+	LeastInflight   bool    `json:"least_inflight"`
+	InflightPenalty float64 `json:"inflight_penalty"` // 权重除以 (1 + inflight*penalty)
+
+	SessionSticky SessionSticky `json:"session_sticky"`
+	Batch         Batch         `json:"batch"`
+	Warmup        Warmup        `json:"warmup"`
 }
 
 // Config 是根配置。
@@ -123,6 +166,27 @@ func Default() Config {
 			UpstreamTimeout:   Duration(300 * time.Second),
 			VideoTimeout:      Duration(600 * time.Second),
 			StickyTTL:         Duration(72 * time.Hour),
+
+			LeastInflight:   true,
+			InflightPenalty: 3,
+			SessionSticky: SessionSticky{
+				Enabled:        true,
+				TTL:            Duration(30 * time.Minute),
+				MaxEntries:     2000,
+				PrefixAffinity: true,
+			},
+			Batch: Batch{
+				Mode:                 "auto",
+				Size:                 3,
+				Min:                  1,
+				Max:                  0,
+				TargetInflightPerKey: 4,
+			},
+			Warmup: Warmup{
+				Enabled:     true,
+				OnStart:     true,
+				Concurrency: 4,
+			},
 		},
 	}
 	c.Logging.RingSize = 400
@@ -195,6 +259,32 @@ func (c *Config) normalize() {
 	}
 	if c.Logging.RingSize <= 0 {
 		c.Logging.RingSize = 400
+	}
+	switch c.Pool.Batch.Mode {
+	case "off", "auto", "fixed":
+	default:
+		c.Pool.Batch.Mode = "auto"
+	}
+	if c.Pool.Batch.Min <= 0 {
+		c.Pool.Batch.Min = 1
+	}
+	if c.Pool.Batch.Size <= 0 {
+		c.Pool.Batch.Size = 3
+	}
+	if c.Pool.Batch.TargetInflightPerKey <= 0 {
+		c.Pool.Batch.TargetInflightPerKey = 4
+	}
+	if c.Pool.InflightPenalty <= 0 {
+		c.Pool.InflightPenalty = 3
+	}
+	if c.Pool.SessionSticky.TTL.Duration() <= 0 {
+		c.Pool.SessionSticky.TTL = Duration(30 * time.Minute)
+	}
+	if c.Pool.SessionSticky.MaxEntries <= 0 {
+		c.Pool.SessionSticky.MaxEntries = 2000
+	}
+	if c.Pool.Warmup.Concurrency <= 0 {
+		c.Pool.Warmup.Concurrency = 4
 	}
 }
 

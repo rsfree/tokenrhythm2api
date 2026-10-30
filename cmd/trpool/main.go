@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -121,6 +123,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.Pool.Warmup.Enabled && cfg.Pool.Warmup.OnStart {
+		go warmup(ctx, p, up, cfg.Pool.Warmup.Concurrency)
+	}
 	go pinger(ctx, p, prices, up, cfg)
 	go saver(ctx, p, daily, statePath, &persistDirty)
 
@@ -208,22 +213,44 @@ func pinger(ctx context.Context, p *pool.Pool, prices *ledger.Prices, up *upstre
 	probeTick := time.NewTicker(probeEvery)
 	defer probeTick.Stop()
 
+	var keepTick *time.Ticker
+	if iv := cfg.Pool.Warmup.Interval.Duration(); cfg.Pool.Warmup.Enabled && iv > 0 {
+		keepTick = time.NewTicker(iv)
+		defer keepTick.Stop()
+	}
+	var keepC <-chan time.Time
+	if keepTick != nil {
+		keepC = keepTick.C
+	}
+
 	refreshPrices := func() {
-		secret := firstUsableSecret(p)
-		if secret == "" {
+		var lastErr error
+		for _, v := range p.Views() {
+			if !v.Enabled || v.State == "invalid" || v.State == "disabled" {
+				continue
+			}
+			secret, ok := p.SecretOf(v.ID)
+			if !ok {
+				continue
+			}
+			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			body, err := up.FetchModels(c, secret)
+			cancel()
+			if err != nil {
+				// 单个号挂着（冻结/限流）不该拖垮整张价目表，换下一个号继续试。
+				lastErr = err
+				continue
+			}
+			if err := prices.Load(body); err != nil {
+				lastErr = err
+				continue
+			}
+			log.Printf("价目表已更新：%d 个模型（经 %s）", prices.Count(), v.Name)
 			return
 		}
-		c, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		body, err := up.FetchModels(c, secret)
-		if err != nil {
-			return
+		if lastErr != nil {
+			log.Printf("WARN: 价目表刷新失败，所有号都不可用: %v", lastErr)
 		}
-		if err := prices.Load(body); err != nil {
-			log.Printf("WARN: 价目表解析失败: %v", err)
-			return
-		}
-		log.Printf("价目表已更新：%d 个模型", prices.Count())
 	}
 
 	// 启动即拉一次价目表：否则头几分钟记出来的成本全是 0，账就不可信了。
@@ -239,6 +266,9 @@ func pinger(ctx context.Context, p *pool.Pool, prices *ledger.Prices, up *upstre
 			if prices.Count() == 0 {
 				refreshPrices()
 			}
+		case <-keepC:
+			// 周期保活：保持连接热 + 尽早发现整体性故障
+			warmup(ctx, p, up, cfg.Pool.Warmup.Concurrency)
 		case <-probeTick.C:
 			if !cfg.AutoProbe.Enabled {
 				continue
@@ -251,24 +281,81 @@ func pinger(ctx context.Context, p *pool.Pool, prices *ledger.Prices, up *upstre
 	}
 }
 
-func firstUsableSecret(p *pool.Pool) string {
-	for _, v := range p.Views() {
+// warmup 启动时把所有启用的号并发探一遍。
+//
+// 这不是"模型冷启动"——上游是 API 网关，没有加载权重那回事。价值在两点：
+//  1. 启动后立刻知道每个号真实可用，不让第一波业务请求去试错；
+//  2. 顺带把到上游的 TLS 连接建起来，首个真实请求省掉握手。
+//
+// 只打 /v1/models，不消耗生成额度。
+func warmup(ctx context.Context, p *pool.Pool, up *upstream.Client, conc int) {
+	views := p.Views()
+	if len(views) == 0 {
+		return
+	}
+	if conc <= 0 {
+		conc = 4
+	}
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for _, v := range views {
 		if !v.Enabled {
 			continue
 		}
-		if v.State == "active" || v.State == "cooling" {
-			if s, ok := p.SecretOf(v.ID); ok {
-				return s
-			}
+		secret, ok := p.SecretOf(v.ID)
+		if !ok {
+			continue
 		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id, name, secret string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			c, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if _, err := up.FetchModels(c, secret); err != nil {
+				// 预热的全部价值就在这一步：探出坏号并直接记进状态，
+				// 而不是只打一行日志、让第一波业务请求再试错一遍。
+				markByProbeError(p, id, err)
+				log.Printf("预热失败 %s: %v", name, err)
+				return
+			}
+			// 注意：不在这里 Reset。models 探活成功只说明"这个号能取模型列表"，
+			// 不代表 chat 可用（模型级灰度、账号级风控都可能只拦生成接口）。
+			// 探活成功就把 cooling 拉回 active，等于让业务请求替我们重试。
+			// 冷却交给 Tick 按时间自然恢复，那是真实流量给出的判断。
+		}(v.ID, v.Name, secret)
 	}
-	return ""
+	wg.Wait()
+	log.Printf("预热完成：%d 个号，耗时 %dms", len(views), time.Since(start).Milliseconds())
+}
+
+// markByProbeError 把一次探活失败翻译成号的状态转移。
+// 只处理"确定是这个号的问题"的几类；网络抖动之类不动状态，免得误伤。
+func markByProbeError(p *pool.Pool, id string, err error) {
+	var se *upstream.StatusError
+	if !errors.As(err, &se) {
+		return
+	}
+	switch {
+	case se.Status == http.StatusUnauthorized:
+		p.MarkFail(id, pool.FailAuth, se.Error())
+	case se.Status == http.StatusTooManyRequests:
+		p.MarkFail(id, pool.FailRate, se.Error())
+	case se.Status == http.StatusForbidden &&
+		bytes.Contains(se.Body, []byte("ACCOUNT_SUSPENDED")):
+		// 账号被临时冻结：按额度类冷却（ExhaustedCooldown），比 429 退避更久
+		p.MarkFail(id, pool.FailQuota, se.Error())
+	}
 }
 
 // probeBroken 只探"应该能用但现在不能用"的号，避免无谓的上游调用。
 func probeBroken(ctx context.Context, p *pool.Pool, up *upstream.Client) {
 	for _, v := range p.Views() {
-		if !v.Enabled || v.State == "active" || v.State == "disabled" {
+		// 只探 invalid：那是 401（key 失效），探通了说明又能用了。
+		// cooling/exhausted 是按时间恢复的，不该被一次 models 探活提前放行。
+		if !v.Enabled || v.State != "invalid" {
 			continue
 		}
 		secret, ok := p.SecretOf(v.ID)
@@ -281,6 +368,8 @@ func probeBroken(ctx context.Context, p *pool.Pool, up *upstream.Client) {
 		if err == nil {
 			p.Reset(v.ID)
 			log.Printf("探活成功，号 %s 已恢复", v.Name)
+		} else {
+			markByProbeError(p, v.ID, err)
 		}
 	}
 }
