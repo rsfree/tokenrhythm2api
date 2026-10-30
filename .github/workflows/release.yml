@@ -38,12 +38,24 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
-          BASE=${PREV:-v0.0.0}
-          IFS=. read -r MA MI PA <<< "${BASE#v}"
-          # 去掉可能的预发布后缀，否则 $((PA+1)) 会报错
-          PA="${PA%%[-+]*}"
-          NEW="v${MA}.${MI}.$((PA + 1))"
+          # 手动重跑（如补镜像）时，HEAD 上已经有版本 tag 就直接复用它，
+          # 否则每次重跑都会再自增一个空版本，Release 列表被垃圾版本淹没。
+          REUSE=''
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            REUSE=$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+          fi
+          if [ -n "${REUSE}" ]; then
+            NEW="${REUSE}"
+            PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -vx "${REUSE}" | head -n1 || true)
+            echo "重跑模式：复用 HEAD 上的 tag ${NEW}"
+          else
+            PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+            BASE=${PREV:-v0.0.0}
+            IFS=. read -r MA MI PA <<< "${BASE#v}"
+            # 去掉可能的预发布后缀，否则 $((PA+1)) 会报错
+            PA="${PA%%[-+]*}"
+            NEW="v${MA}.${MI}.$((PA + 1))"
+          fi
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
           echo "next=${NEW}" >> "$GITHUB_OUTPUT"
           echo "Previous: ${PREV:-<none>} -> Next: ${NEW}"
@@ -97,7 +109,11 @@ jobs:
           set -euo pipefail
           TAG='${{ steps.ver.outputs.next }}'
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "::error::tag ${TAG} already exists"
+            if [ "$(git rev-list -n1 "${TAG}")" = "$(git rev-parse HEAD)" ]; then
+              echo "tag ${TAG} 已指向本次提交（重跑），跳过打 tag"
+              exit 0
+            fi
+            echo "::error::tag ${TAG} 已存在且指向其它提交"
             exit 1
           fi
           # runner 上没有全局 git 身份，annotated tag 会以 128 退出
@@ -146,21 +162,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image tag
+      - name: Compute image tags
         id: tag
         run: |
           set -euo pipefail
           V='${{ needs.release.outputs.version }}'
           V="${V#v}"          # git tag 带 v，镜像 tag 不带
+          SHA=$(printf '%s' '${{ github.sha }}' | cut -c1-7)
           echo "value=${V}" >> "$GITHUB_OUTPUT"
-          echo "image tag: ${V}"
+          echo "short=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "image tags: ${V} / latest / sha-${SHA}"
 
       - name: Build image
         run: |
           set -euo pipefail
+          # 三个 tag 必须来自同一次 build，否则 digest 会不同
           docker build \
             --build-arg VERSION='${{ needs.release.outputs.version }}' \
-            -t "${IMAGE}:${{ steps.tag.outputs.value }}" .
+            -t "${IMAGE}:${{ steps.tag.outputs.value }}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-${{ steps.tag.outputs.short }}" .
 
       - name: Smoke test before push
         run: |
