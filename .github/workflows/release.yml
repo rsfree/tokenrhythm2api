@@ -55,7 +55,9 @@ jobs:
           {
             echo "## Changes"
             echo
-            git log "$RANGE" --pretty='- %s (%h)' --no-merges | head -n 60 || true
+            # 带逃生阀标记的提交本来就声明了"不发布"，别列进 Release 正文
+            git log "$RANGE" --pretty='- %s (%h)' --no-merges \
+              | grep -vF '[skip release]' | head -n 60 || true
             if [ -n "${PREV}" ]; then
               echo
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${{ steps.ver.outputs.next }}"
