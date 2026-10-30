@@ -87,8 +87,10 @@ docker run -d --name trpool --restart unless-stopped \
   ghcr.io/rsfree/tokenrhythm2api:latest
 ```
 
-> 镜像 tag 与 git tag 同版本但**不带 `v` 前缀**（`v0.0.3` → `:0.0.3`），另有 `:latest` 和 `:sha-<7位>`。
-> 若包是 private，先 `echo $TOKEN | docker login ghcr.io -u <user> --password-stdin`。
+> 镜像 tag 与 git tag 同版本但**不带 `v` 前缀**（`v0.0.4` → `:0.0.4`），另有 `:latest` 和 `:sha-<7位>`，
+> 三者来自同一次构建（digest 相同）。
+>
+> 当前只构建 **linux/amd64**。在 arm64 机器上会走模拟层，能跑但慢；需要原生 arm64 镜像再加多平台构建。
 
 ---
 
