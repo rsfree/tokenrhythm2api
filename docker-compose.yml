@@ -1,0 +1,22 @@
+services:
+  trpool:
+    build: .
+    image: trpool:latest
+    container_name: trpool
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # 必填：面板/管理接口令牌
+      TRPOOL_ADMIN_KEY: ${TRPOOL_ADMIN_KEY:?请先 export TRPOOL_ADMIN_KEY=...}
+      # 必填：下发给客户端的密钥，多个用逗号分隔
+      TRPOOL_CLIENT_KEYS: ${TRPOOL_CLIENT_KEYS:?请先 export TRPOOL_CLIENT_KEYS=...}
+      TRPOOL_UPSTREAM: ${TRPOOL_UPSTREAM:-https://tokenrhythm.studio}
+    volumes:
+      # 号池状态 + 账本 + 粘性表，丢了会重新记账
+      - ./data:/data/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

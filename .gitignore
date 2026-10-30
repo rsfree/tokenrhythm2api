@@ -1,0 +1,6 @@
+data/
+config.json
+/trpool
+*.log
+.DS_Store
+.workbuddy/

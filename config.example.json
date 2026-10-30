@@ -1,0 +1,35 @@
+{
+  "listen": ":8787",
+  "upstream": "https://tokenrhythm.studio",
+  "data_dir": "./data",
+  "admin_key": "",
+  "client_keys": [],
+  "allow_upstream_key_passthrough": false,
+  "pool": {
+    "strategy": "weighted_random",
+    "top_k": 5,
+    "max_in_flight": 4,
+    "max_in_flight_global": 0,
+    "breaker_threshold": 3,
+    "breaker_cooldown": "30s",
+    "breaker_cooldown_max": "5m",
+    "rate_cooldown": "20s",
+    "rate_cooldown_max": "10m",
+    "exhausted_cooldown": "30m",
+    "credit_floor": 0.5,
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 4,
+    "retry_max": 3,
+    "upstream_timeout": "300s",
+    "video_timeout": "600s",
+    "sticky_ttl": "72h"
+  },
+  "logging": {
+    "ring_size": 400,
+    "log_bodies": false
+  },
+  "auto_probe": {
+    "enabled": true,
+    "interval": "2m"
+  }
+}
