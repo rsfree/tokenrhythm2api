@@ -403,12 +403,38 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 | 页 | 解决什么 |
 |---|---|
 | **总览** | 可用号/请求/消耗/今日四张卡；调度快照（活跃窗口 `在用/目标`、池子可用数、窗口内 429 占比与触发线、弹性余量、会话/在途/粘性）；**最近异常**——失败请求按时间倒序，带状态码、号名、模型与上游原话 |
-| **账号池** | 状态、余额进度条、请求/错误/Token、当前权重、最后错误；`B` = 当前活跃窗口成员，数字 = 粘在该号上的会话数，`M 模型` = 模型级封禁。操作：探活、重置、编辑、启停、删除、补额度、解除单模型封禁 |
+| **账号池** | 状态、余额进度条、请求/错误/Token、当前权重、最后错误；`B` = 当前活跃窗口成员，数字 = 粘在该号上的会话数，`M 模型` = 模型级封禁。操作：探活、重置、编辑、启停、删除、补额度、解除单模型封禁；**添加号** 支持「单个 / 批量」——批量页把整列密钥粘进文本框即可，一行一个 |
 | **用量** | 今日/近 14 日消耗、单请求均价、Token 总量；日账表；**号 · 消耗构成** 与 **模型 · 近期成本** |
 | **容量规划** | 可用号数、理论 RPM（`key_qps × 60 × 可用号`）、安全在飞数（`ceil(key_qps × p95)`）、观测 p95 与实测 RPM；每号容量表。**这页是判断"要不要加号"的依据** |
 | **模型与档位** | 上游价目表：输入/输出/缓存读单价、是否按单价记账；搜索 + 一键刷新；**模型级封禁**列表（哪个号在哪个模型上被封、还剩多久、一键解除） |
 | **配置** | 调度参数热更新（保存即生效并写回 `config.json` 的 `pool` 段）：搜索策略、活跃窗口模式/大小、弹性扩容（开关/上限/步长/触发线/统计窗口/稳定回退）；运行时只读信息；客户端密钥查看与复制 |
 | **运行日志** | 逐请求记录；按状态（全部/仅失败/仅成功）、号、模型、文本过滤；每条带耗时、tokens、成本、第几次尝试、备注，`trace` 按钮复制 trace_id。可切「历史归档」跨重启查 |
+
+### 批量加号
+
+账号池 → 右上角「+ 添加号」→ 切到「批量」，把密钥整列粘进去：
+
+```
+sk_tr_xxxxxxxx
+sk_tr_yyyyyyyy
+主账号=sk_tr_zzzzzzzz          ← 「=」、逗号、制表符、空格都能分名称
+# 这一行会被跳过
+```
+
+- 只给密钥的行按 **名称前缀 + 序号** 自动命名（前缀留空则 `key-<池内条数+1>` 起）；
+  也可在批量页填「统一充值额」，一次给整批号记同一个本金。
+- **一行失败不影响其它行**：非法形态、池中已有、本批重复都会被单独跳过，失败行号与原因直接列在表单下方；
+  已经进池的号不会被重复提交加出第二份（重复密钥一律跳过）。
+- 单次上限 500 个。导入后立刻参与活跃窗口，不用等下一笔请求才补齐。
+
+同一个接口给脚本用：
+
+```bash
+curl -X POST "https://trpool.1task.cn/panel/api/keys/batch" \
+  -H "Authorization: Bearer $TRPOOL_ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"secrets":"sk_tr_a\nsk_tr_b","name_prefix":"tr-","budget":100}'
+# → {"ok":true,"total":2,"added":2,"skipped":0,"results":[{"line":1,"name":"tr-1","id":"..."},...]}
+```
 
 排查动线：**总览看异常 → 点号名看该号状态 → 运行日志按号过滤看时间线 → 容量规划判断是不是撞了窗口**。
 
@@ -420,6 +446,7 @@ GET    /panel/api/logs?n=400[&history=1&key=&model=&errors=1&q=]
 GET    /panel/api/capacity
 GET    /panel/api/models
 POST   /panel/api/keys              {name, secret, weight, budget}
+POST   /panel/api/keys/batch        {secrets, name_prefix?, budget?, weight?}   # 每行一个，可「名称=密钥」
 PATCH  /panel/api/keys/{id}         {name?, secret?, weight?, budget?, enabled?}
 DELETE /panel/api/keys/{id}
 POST   /panel/api/keys/{id}/reset               # 清冷却/熔断/封禁/失败计数

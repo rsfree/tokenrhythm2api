@@ -89,13 +89,22 @@ func (p *Pool) Config() config.PoolConfig {
 
 // ---------- 增删改 ----------
 
-func (p *Pool) Add(name, secret string, weight, budget float64) (*Key, error) {
-	secret = strings.TrimSpace(secret)
+// validateSecret 校验密钥形态。单个/批量入池共用同一套判定，
+// 免得两条路径对什么算合法密钥各说各话。
+func validateSecret(secret string) error {
 	if secret == "" {
-		return nil, fmt.Errorf("密钥不能为空")
+		return fmt.Errorf("密钥不能为空")
 	}
 	if !strings.HasPrefix(secret, "sk-") && !strings.HasPrefix(secret, "sk_") {
-		return nil, fmt.Errorf("密钥形态不对：应以 sk- 或 sk_ 开头")
+		return fmt.Errorf("密钥形态不对：应以 sk- 或 sk_ 开头")
+	}
+	return nil
+}
+
+func (p *Pool) Add(name, secret string, weight, budget float64) (*Key, error) {
+	secret = strings.TrimSpace(secret)
+	if err := validateSecret(secret); err != nil {
+		return nil, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -105,13 +114,21 @@ func (p *Pool) Add(name, secret string, weight, budget float64) (*Key, error) {
 			return nil, fmt.Errorf("该密钥已在池中（%s）", k.Name)
 		}
 	}
+	k := p.addLocked(name, secret, weight, budget, time.Now())
+	// 新号入池立刻参与窗口：批量导 100 个号时不用等下一笔请求才补齐。
+	p.refreshBatchLocked(k.CreatedAt)
+	p.notify()
+	return k, nil
+}
+
+// addLocked 插入一个号，不做去重、不刷新窗口——调用方持锁并负责这两件事。
+func (p *Pool) addLocked(name, secret string, weight, budget float64, now time.Time) *Key {
 	if name == "" {
 		name = fmt.Sprintf("key-%d", len(p.keys)+1)
 	}
 	if weight <= 0 {
 		weight = 1
 	}
-	now := time.Now()
 	k := &Key{
 		ID:        newID(),
 		Name:      name,
@@ -124,10 +141,67 @@ func (p *Pool) Add(name, secret string, weight, budget float64) (*Key, error) {
 	}
 	p.keys[k.ID] = k
 	p.order = append(p.order, k.ID)
-	// 新号入池立刻参与窗口：批量导 100 个号时不用等下一笔请求才补齐。
-	p.refreshBatchLocked(now)
-	p.notify()
-	return k, nil
+	return k
+}
+
+// KeyDraft 是一条待入池的号（批量导入用）。
+type KeyDraft struct {
+	Name   string
+	Secret string
+	Weight float64
+	Budget float64
+}
+
+// KeyDraftResult 是批量导入里单条的结果：Error 非空表示这条没进池。
+type KeyDraftResult struct {
+	Key   *Key
+	Name  string
+	Error error
+}
+
+// AddMany 批量入池：只加一次锁、只刷新一次窗口、只通知一次落盘。
+//
+// 单条失败不拖累其它行——粘 100 个号时中间混进一行手滑很正常，全废掉最难受。
+// 因此返回与 drafts 等长的结果，逐条交代进没进池、为什么没进。
+func (p *Pool) AddMany(drafts []KeyDraft) []KeyDraftResult {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	// secret -> 冲突说明；先灌入池子里已有的，再在循环里把本批已收的写进去，
+	// 这样"与池中重复"和"本批第 N 行重复"能给出不同的提示。
+	known := make(map[string]error, len(p.keys)+len(drafts))
+	for _, k := range p.keys {
+		known[k.Secret] = fmt.Errorf("该密钥已在池中（%s）", k.Name)
+	}
+
+	out := make([]KeyDraftResult, len(drafts))
+	added := 0
+	for i, d := range drafts {
+		secret := strings.TrimSpace(d.Secret)
+		res := KeyDraftResult{Name: strings.TrimSpace(d.Name)}
+		if err := validateSecret(secret); err != nil {
+			res.Error = err
+			out[i] = res
+			continue
+		}
+		if why, dup := known[secret]; dup {
+			res.Error = why
+			out[i] = res
+			continue
+		}
+		k := p.addLocked(res.Name, secret, d.Weight, d.Budget, now)
+		known[secret] = fmt.Errorf("与第 %d 行是同一个密钥", i+1)
+		res.Key = k
+		res.Name = k.Name
+		out[i] = res
+		added++
+	}
+	if added > 0 {
+		p.refreshBatchLocked(now)
+		p.notify()
+	}
+	return out
 }
 
 // Update 只改允许外部改的字段；nil 表示不动。

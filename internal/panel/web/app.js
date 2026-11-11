@@ -21,6 +21,7 @@ const state = {
   filters: { status: 'all', key: 'all', model: 'all', text: '' },
   history: false,          // 是否查 JSONL 归档（跨重启/跨天）
   historyAt: 0,
+  addMode: 'single',       // 加号表单：single | batch
 };
 
 const VIEW_META = {
@@ -786,12 +787,88 @@ $('btnRefresh').addEventListener('click', () => refresh().then(() => { if (state
 $('btnAddToggle').addEventListener('click', () => {
   const f = $('addForm');
   f.hidden = !f.hidden;
-  if (!f.hidden) $('addName').focus();
+  if (!f.hidden) setAddMode(state.addMode || 'single');
+});
+
+// 单个 / 批量切换：两套输入框共用一次提交，靠 state.addMode 决定走哪个接口。
+function setAddMode(mode) {
+  state.addMode = mode === 'batch' ? 'batch' : 'single';
+  document.querySelectorAll('#addForm .seg').forEach((b) => {
+    b.classList.toggle('on', b.dataset.addmode === state.addMode);
+  });
+  $('addSingle').hidden = state.addMode !== 'single';
+  $('addBatch').hidden = state.addMode !== 'batch';
+  $('addModeHint').textContent = state.addMode === 'batch'
+    ? '一行一个，可整列粘贴（单次最多 500 个，重复的会自动跳过）'
+    : '一次一个号';
+  const errBox = $('addErr');
+  errBox.textContent = '';
+  errBox.classList.remove('pre');
+  if (state.addMode === 'batch') $('addBatchText').focus();
+  else $('addName').focus();
+}
+
+document.querySelectorAll('#addForm .seg').forEach((b) => {
+  b.addEventListener('click', () => setAddMode(b.dataset.addmode));
+});
+
+// 只是个提示数字：真正的解析在服务端，这里按"像密钥的行"粗算，别让两边算法各说各话。
+function countBatchKeys(text) {
+  return text.split('\n').filter((l) => l.includes('sk-') || l.includes('sk_')).length;
+}
+
+$('addBatchText').addEventListener('input', () => {
+  const n = countBatchKeys($('addBatchText').value);
+  $('addCount').textContent = `已识别 ${n} 个密钥`;
 });
 
 $('addForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  $('addErr').textContent = '';
+  const errBox = $('addErr');
+  errBox.textContent = '';
+  errBox.classList.remove('pre');
+
+  if (state.addMode === 'batch') {
+    const secrets = $('addBatchText').value;
+    if (!secrets.trim()) {
+      errBox.textContent = '先把密钥粘进来';
+      return;
+    }
+    const btn = e.submitter;
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api('/panel/api/keys/batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          secrets,
+          name_prefix: $('addPrefix').value.trim(),
+          budget: parseFloat($('addBatchBudget').value) || 0,
+        }),
+      });
+      await refresh();
+      const bad = (r.results || []).filter((x) => x.error);
+      if (bad.length) {
+        // 成功的已经进池了，文本区不清空：改掉报错那几行再提交，
+        // 剩下的重复密钥会被服务端按"已在池中"跳过，不会加出第二份。
+        errBox.classList.add('pre');
+        const shown = bad.slice(0, 10).map((x) => `第 ${x.line} 行${x.name ? ' ' + x.name : ''} — ${x.error}`);
+        if (bad.length > shown.length) shown.push(`…另有 ${bad.length - shown.length} 行同样没进池`);
+        errBox.textContent = `已加入 ${r.added} 个，跳过 ${r.skipped} 个：\n` + shown.join('\n');
+        toast(`加入 ${r.added} 个，跳过 ${r.skipped} 个`, r.added === 0);
+      } else {
+        $('addBatchText').value = '';
+        $('addCount').textContent = '已识别 0 个密钥';
+        $('addForm').hidden = true;
+        toast(`已加入 ${r.added} 个号`);
+      }
+    } catch (err) {
+      errBox.textContent = err.message;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+    return;
+  }
+
   const payload = {
     name: $('addName').value.trim(),
     secret: $('addSecret').value.trim(),

@@ -129,10 +129,30 @@
             </div>
 
             <form class="add-form" id="addForm" hidden>
-              <input id="addName" placeholder="名称，如 主账号" autocomplete="off">
-              <input id="addSecret" placeholder="sk_tr_..." autocomplete="off" spellcheck="false">
-              <input id="addBudget" type="number" step="0.01" min="0" placeholder="充值额 ¥（可空）">
-              <button class="btn small" type="submit">加入池</button>
+              <div class="add-tabs">
+                <button type="button" class="seg on" data-addmode="single">单个</button>
+                <button type="button" class="seg" data-addmode="batch">批量</button>
+                <span class="muted" id="addModeHint">一次一个号</span>
+              </div>
+
+              <div class="add-single" id="addSingle">
+                <input id="addName" placeholder="名称，如 主账号" autocomplete="off">
+                <input id="addSecret" placeholder="sk_tr_..." autocomplete="off" spellcheck="false">
+                <input id="addBudget" type="number" step="0.01" min="0" placeholder="充值额 ¥（可空）">
+                <button class="btn small" type="submit">加入池</button>
+              </div>
+
+              <div class="add-batch" id="addBatch" hidden>
+                <textarea id="addBatchText" rows="7" spellcheck="false" autocomplete="off"
+                  placeholder="每行一个密钥，可直接粘贴一整列：&#10;sk_tr_xxxxxxxxxxxx&#10;sk_tr_yyyyyyyyyyyy&#10;&#10;也能带名称：主账号=sk_tr_zzz&#10;分隔符 = 、逗号、制表符、空格都能认；空行和 # 开头的行会跳过"></textarea>
+                <div class="add-batch-opts">
+                  <input id="addPrefix" placeholder="名称前缀（空则 key-）" autocomplete="off">
+                  <input id="addBatchBudget" type="number" step="0.01" min="0" placeholder="统一充值额 ¥（可空）">
+                  <button class="btn small" type="submit">批量加入</button>
+                  <span class="muted" id="addCount">已识别 0 个密钥</span>
+                </div>
+              </div>
+
               <span class="err" id="addErr"></span>
             </form>
 

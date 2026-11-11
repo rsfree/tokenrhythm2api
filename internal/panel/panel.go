@@ -53,6 +53,8 @@ func New(d Deps) *Panel {
 	p.mux.HandleFunc("/panel/api/capacity", p.guard(p.handleCapacity))
 	p.mux.HandleFunc("/panel/api/models", p.guard(p.handleModels))
 	p.mux.HandleFunc("/panel/api/keys", p.guard(p.handleKeys))
+	// 比 "/panel/api/keys/" 这个子树更具体，ServeMux 会优先匹配到它
+	p.mux.HandleFunc("/panel/api/keys/batch", p.guard(p.handleKeysBatch))
 	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
 	p.mux.HandleFunc("/panel/api/keys/", p.guard(p.handleKeyItem))
 	p.mux.HandleFunc("/panel/api/pool", p.guard(p.handlePool))
