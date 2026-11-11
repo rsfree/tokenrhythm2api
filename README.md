@@ -341,6 +341,7 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 | 充值后 | 补额度（`POST /panel/api/keys/{id}/budget`）→ 欠费号自动恢复 |
 | 批量充值后 | 号池右上「恢复停用号」（`POST /panel/api/keys/revive`）一次放回来 |
 | 确认已解封 | 单号「探活」成功（需配了探活模型，见下），或「重置」 |
+| 号彻底不用了 | 号池右上「清理停用号」（`POST /panel/api/keys/prune`）按状态批量删 |
 
 冻结号（`blocked`）不会被补额度解开——那是上游的处罚，充钱没用；人工停用的号也不会被探活放回来。
 
@@ -491,6 +492,31 @@ curl -X POST "https://trpool.1task.cn/panel/api/keys/batch" \
 # → {"ok":true,"total":2,"added":2,"skipped":0,"results":[{"line":1,"name":"tr-1","id":"..."},...]}
 ```
 
+### 批量清理停用号
+
+一堆号集体欠费之后，一个个点「删除」要按几十次确认。号池右上「清理停用号」把这件事一次做完：
+勾选要清的状态（**余额不足 402 / 账号冻结 403 / 人工停用 / 密钥失效 401**，每项后面跟着当前有几个），
+按钮上实时显示"删除选中的 N 个"，确认框里把名单摊开再动手。
+
+- **只删已停用的号**：`active` / `cooling` 永远不在清理范围，接口收到这两个状态直接 400，
+  不会"静默跳过"——那会让人以为清干净了。
+- 「人工停用」按面板口径归类：`enabled=false` 的号不管底层状态是 `exhausted` 还是 `blocked`，
+  都算人工停用。
+- **`invalid`（401）默认不勾**：它还可能被探活救回来，想删得自己勾上。
+- 删号**不可逆**：密钥在网关侧只存 `data/state.json` 这一份，删了只能翻备份。
+  接口因此留了 `dry_run`，脚本可以先看清单：
+
+```bash
+curl -X POST "https://trpool.1task.cn/panel/api/keys/prune" \
+  -H "Authorization: Bearer $TRPOOL_ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"dry_run":true}'
+# → {"ok":true,"dry_run":true,"matched":20,"removed":0,"states":["exhausted","blocked","disabled"],
+#    "names":["tr-1","tr-2",...]}
+```
+
+`states` 留空即默认 `["exhausted","blocked","disabled"]`（也就是面板上的"停用号"）。
+删号会顺手清掉该号的 batch 成员身份与粘性会话，不会留下指向空号的脏数据。
+
 排查动线：**总览看异常 → 点号名看该号状态 → 运行日志按号过滤看时间线 → 容量规划判断是不是撞了窗口**。
 
 管理接口（均需 `Authorization: Bearer <admin_key>`）：
@@ -510,6 +536,7 @@ POST   /panel/api/keys/{id}/budget  {delta}     # 调整充值额（¥）
 DELETE /panel/api/keys/{id}/models?model=xxx    # 解除单模型封禁
 POST   /panel/api/keys/probe                    # 全池探活（跳过人工停用的号）
 POST   /panel/api/keys/revive                   # 批量恢复因欠费/冻结停用的号
+POST   /panel/api/keys/prune                    # 批量删除停用号 {states?, dry_run?}
 PUT    /panel/api/probe                         # 改探活模型 {model?, max_tokens?}（空 = 只拉 /v1/models）
 PUT    /panel/api/pool                          # 热更新调度参数
 POST   /panel/api/prices                        # 刷新价目表

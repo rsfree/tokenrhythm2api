@@ -287,6 +287,16 @@ func (p *Pool) Update(id string, name, secret *string, weight, budget *float64, 
 func (p *Pool) Remove(id string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.removeLocked(id) {
+		return false
+	}
+	p.refreshBatchLocked(time.Now())
+	p.notify()
+	return true
+}
+
+// removeLocked 只做删除本身，不刷新窗口也不通知落盘——批量删（Prune）要的是一次刷完。
+func (p *Pool) removeLocked(id string) bool {
 	if p.keys[id] == nil {
 		return false
 	}
@@ -303,9 +313,72 @@ func (p *Pool) Remove(id string) bool {
 		}
 	}
 	p.batch = removeString(p.batch, id)
+	return true
+}
+
+// canPrune 是允许被批量清理删掉的状态白名单。
+//
+// 只认"已经不再派单"的终态。active/cooling 永远不在里面：批量删是给
+// "清掉一堆死号"用的，一旦手滑把还在干活的号删了，密钥就再也拿不回来
+// （state.json 里存的是唯一副本），所以这里宁可保守。
+var canPrune = map[State]bool{
+	StateExhausted: true, // 402 欠费
+	StateBlocked:   true, // 403 冻结
+	StateInvalid:   true, // 401 密钥失效
+	StateDisabled:  true, // 人工停用
+}
+
+// Prune 按状态批量删号，返回命中的号名。
+//
+// dryRun 为真时只报"会删哪些"，不动池子——批量删除是不可逆的（state.json 里的
+// 密钥是唯一副本），得先让人看见清单再下手。
+//
+// states 里出现 active/cooling 直接报错而不是"跳过"：那种请求说明调用方
+// 对这批号的理解和池子不一致，静默跳过只会让人以为删干净了。
+func (p *Pool) Prune(states []State, dryRun bool) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	want := make(map[State]bool, len(states))
+	for _, s := range states {
+		if !canPrune[s] {
+			return nil, fmt.Errorf("不允许批量删除该状态: %q（只能删 停用/欠费/冻结/失效）", s)
+		}
+		want[s] = true
+	}
+	if len(want) == 0 {
+		return nil, fmt.Errorf("没有指定要清理的状态")
+	}
+
+	var names []string
+	ids := make([]string, 0, len(p.order))
+	for _, id := range p.order {
+		k := p.keys[id]
+		if k == nil {
+			continue
+		}
+		// 面板上"停用"是按 enabled 显示的：人工摘号不管底层是什么状态都算停用。
+		st := k.State
+		if !k.Enabled {
+			st = StateDisabled
+		}
+		if want[st] {
+			names = append(names, k.Name)
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if dryRun {
+		return names, nil
+	}
+	for _, id := range ids {
+		p.removeLocked(id)
+	}
 	p.refreshBatchLocked(time.Now())
 	p.notify()
-	return true
+	return names, nil
 }
 
 // ReviveStopped 一次性把因欠费/冻结停用的号全部拉回 active。

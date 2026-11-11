@@ -388,6 +388,7 @@ function renderErrFeed(d) {
 function renderAccounts() {
   const keys = state.data.keys || [];
   const tb = $('keyTable').querySelector('tbody');
+  renderPrune();
   if (!keys.length) {
     tb.innerHTML = `<tr><td colspan="8"><div class="empty">池子还是空的 —— 点右上角「添加号」，把 sk_tr_ 密钥加进来。</div></td></tr>`;
     return;
@@ -420,6 +421,48 @@ function renderAccounts() {
       </div></td>
     </tr>`;
   }).join('');
+}
+
+// ---------- 批量清理停用号 ----------
+
+// 四类"已经不再派单"的号。口径和 stateBadge 一致：人工停用（enabled=false）
+// 不管底层是 exhausted 还是 blocked，面板上都显示「已停用」，这里也归到 disabled。
+const PRUNE_KINDS = [
+  { state: 'exhausted', box: 'pruneExhausted', cnt: 'pruneCntExhausted' },
+  { state: 'blocked', box: 'pruneBlocked', cnt: 'pruneCntBlocked' },
+  { state: 'disabled', box: 'pruneDisabled', cnt: 'pruneCntDisabled' },
+  { state: 'invalid', box: 'pruneInvalid', cnt: 'pruneCntInvalid' },
+];
+
+function pruneStateOf(k) {
+  return k.enabled === false ? 'disabled' : k.state;
+}
+
+function prunePicked() {
+  const on = {};
+  PRUNE_KINDS.forEach((x) => { on[x.state] = $(x.box).checked; });
+  return {
+    states: PRUNE_KINDS.filter((x) => on[x.state]).map((x) => x.state),
+    keys: (state.data?.keys || []).filter((k) => on[pruneStateOf(k)]),
+  };
+}
+
+function renderPrune() {
+  const by = {};
+  (state.data?.keys || []).forEach((k) => {
+    const s = pruneStateOf(k);
+    by[s] = (by[s] || 0) + 1;
+  });
+  PRUNE_KINDS.forEach((x) => {
+    const n = by[x.state] || 0;
+    const el = $(x.cnt);
+    el.textContent = n;
+    el.classList.toggle('hot', n > 0 && $(x.box).checked);
+  });
+  const picked = prunePicked().keys.length;
+  const go = $('btnPruneGo');
+  go.textContent = `删除选中的 ${picked} 个`;
+  go.disabled = picked === 0;
 }
 
 // ---------- 渲染：用量 ----------
@@ -1034,6 +1077,40 @@ $('btnPrices').addEventListener('click', async () => {
 });
 
 $('modelSearch').addEventListener('input', () => renderModels());
+
+$('btnPrune').addEventListener('click', () => {
+  const f = $('pruneForm');
+  f.hidden = !f.hidden;
+  if (f.hidden) return;
+  $('pruneErr').textContent = '';
+  renderPrune();
+});
+
+$('btnPruneCancel').addEventListener('click', () => { $('pruneForm').hidden = true; });
+PRUNE_KINDS.forEach((x) => $(x.box).addEventListener('change', renderPrune));
+
+$('pruneForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const { states, keys } = prunePicked();
+  if (!keys.length) { $('pruneErr').textContent = '没有勾选到任何号'; return; }
+  // 删号是不可逆的（密钥在网关侧只存 state.json 这一份），所以确认框里把名单摊开。
+  const head = keys.slice(0, 8).map((k) => k.name).join('、');
+  const more = keys.length > 8 ? ` 等 ${keys.length} 个` : '';
+  if (!confirm(`确认从池中删除 ${keys.length} 个已停用的号？\n\n${head}${more}\n\n删除后网关不再持有这些密钥，只能从 data/state.json 的备份里找回。`)) return;
+
+  const btn = $('btnPruneGo');
+  btn.disabled = true;
+  try {
+    const r = await api('/panel/api/keys/prune', { method: 'POST', body: JSON.stringify({ states }) });
+    await refresh();
+    $('pruneForm').hidden = true;
+    toast(r.removed ? `已删除 ${r.removed} 个停用号` : '没有匹配到要删的号');
+  } catch (err) {
+    $('pruneErr').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 $('btnRevive').addEventListener('click', async () => {
   const btn = $('btnRevive');

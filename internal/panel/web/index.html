@@ -125,8 +125,27 @@
           <section class="panel">
             <div class="panel-head">
               <h2>号池</h2>
-              <div class="panel-actions"><button class="btn ghost small" id="btnRevive">恢复停用号</button><button class="btn ghost small" id="btnAddToggle">+ 添加号</button></div>
+              <div class="panel-actions"><button class="btn ghost small" id="btnPrune">清理停用号</button><button class="btn ghost small" id="btnRevive">恢复停用号</button><button class="btn ghost small" id="btnAddToggle">+ 添加号</button></div>
             </div>
+
+            <form class="add-form" id="pruneForm" hidden>
+              <div class="add-tabs">
+                <strong style="font-size:13px">清理停用号</strong>
+                <span class="muted">只删已停用的号；勾选后点删除，不可撤销</span>
+              </div>
+              <div class="prune-opts">
+                <label class="chk"><input type="checkbox" id="pruneExhausted" checked><span>余额不足（402）</span><b id="pruneCntExhausted">0</b></label>
+                <label class="chk"><input type="checkbox" id="pruneBlocked" checked><span>账号冻结（403）</span><b id="pruneCntBlocked">0</b></label>
+                <label class="chk"><input type="checkbox" id="pruneDisabled" checked><span>人工停用</span><b id="pruneCntDisabled">0</b></label>
+                <label class="chk"><input type="checkbox" id="pruneInvalid"><span>密钥失效（401）</span><b id="pruneCntInvalid">0</b></label>
+              </div>
+              <div class="add-single" style="margin-top:10px">
+                <button class="btn small danger" type="submit" id="btnPruneGo">删除选中的 0 个</button>
+                <button class="btn ghost small" type="button" id="btnPruneCancel">取消</button>
+                <span class="muted">密钥在网关侧只存这一份，删了只能翻 <code>data/state.json</code> 的备份</span>
+              </div>
+              <span class="err" id="pruneErr"></span>
+            </form>
 
             <form class="add-form" id="addForm" hidden>
               <div class="add-tabs">

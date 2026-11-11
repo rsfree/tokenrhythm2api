@@ -58,6 +58,7 @@ func New(d Deps) *Panel {
 	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
 	p.mux.HandleFunc("/panel/api/probe", p.guard(p.handleProbeConfig))
 	p.mux.HandleFunc("/panel/api/keys/revive", p.guard(p.handleReviveStopped))
+	p.mux.HandleFunc("/panel/api/keys/prune", p.guard(p.handlePrune))
 	p.mux.HandleFunc("/panel/api/keys/", p.guard(p.handleKeyItem))
 	p.mux.HandleFunc("/panel/api/pool", p.guard(p.handlePool))
 	p.mux.HandleFunc("/panel/api/prices", p.guard(p.handlePrices))
