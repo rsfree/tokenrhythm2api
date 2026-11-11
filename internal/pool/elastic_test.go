@@ -301,6 +301,34 @@ func TestWindowClampedByPoolSize(t *testing.T) {
 	}
 }
 
+// 统计窗口为 0（配置没走 normalize，例如直接 New 出来）时，样本不能被自己裁掉。
+//
+// 这是 CI 上真实踩到的：Window=0 → trim(now) 把"刚记下"的样本也当过期删了，
+// 429 占比永远 0/0。Windows 上两次 time.Now() 常落在同一刻度所以看不出来，
+// Linux 的纳秒时钟必现。
+func TestElasticZeroWindowStillCounts(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.Strategy = "sequential"
+		c.Batch.Mode = "fixed"
+		c.Batch.Size = 3
+		c.Batch.Elastic = config.Elastic{Enabled: true} // 故意全零值
+	})
+	addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+
+	p.Release(acquire(t, p, PickRequest{Model: "m"}), Outcome{Kind: fault.Rate, Message: "429"})
+	st := p.BatchState()
+	if st.RateTotal != 1 {
+		t.Fatalf("样本总数 = %d, 想要 1（零窗口不该把刚记的样本裁掉）", st.RateTotal)
+	}
+	if st.RateHits != 1 {
+		t.Fatalf("429 命中 = %d, 想要 1", st.RateHits)
+	}
+	if st.WindowSec != 60 {
+		t.Fatalf("窗口秒数 = %d, 零值应按 60s 兜底", st.WindowSec)
+	}
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

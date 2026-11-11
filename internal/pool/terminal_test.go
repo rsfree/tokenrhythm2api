@@ -3,6 +3,7 @@ package pool
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"trpool/internal/config"
 	"trpool/internal/fault"
@@ -79,6 +80,7 @@ func TestBannedIsNotRatePressure(t *testing.T) {
 	// 顺序取号，保证第一笔一定落在 a 上（加权随机每次跑可能落到 b）
 	p := testPool(t, func(c *config.PoolConfig) {
 		c.Batch.Elastic.Enabled = true
+		c.Batch.Elastic.Window = config.Duration(time.Minute)
 		c.Strategy = "sequential"
 	})
 	k := addKey(t, p, "a", 0)

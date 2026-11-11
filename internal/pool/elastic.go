@@ -2,6 +2,8 @@ package pool
 
 import (
 	"time"
+
+	"trpool/internal/config"
 )
 
 // sampleLimit 是窗口内保留的最大样本数。
@@ -81,6 +83,22 @@ func (p *Pool) elasticCapLocked() int {
 
 // evalElasticLocked 按 429 压力调 extra。返回是否发生变化。
 // 调用方必须已持有 p.mu。
+// elasticWindow 返回统计窗口长度，零值按 60s 处理。
+//
+// 不能直接用原值：Window<=0 时 from == now，trim 会把"刚刚记下的样本"也裁掉
+// （样本时间戳必然早于调用方此刻的 now），429 占比永远是 0/0。
+// Linux 的纳秒时钟一测就露；Windows 上两次 time.Now() 常落在同一刻度，
+// 所以这个问题只在 Linux 上显形。配置走 normalize 时本不会为 0，
+// 但 New() 被直接调用（测试、内嵌）时没有这一步，得自己兜住。
+func elasticWindow(e *config.Elastic) time.Duration {
+	if d := e.Window.Duration(); d > 0 {
+		return d
+	}
+	return 60 * time.Second
+}
+
+// evalElasticLocked 按 429 压力调 extra。返回是否发生变化。
+// 调用方必须已持有 p.mu。
 func (p *Pool) evalElasticLocked(now time.Time) bool {
 	e := &p.cfg.Batch.Elastic
 	if !e.Enabled {
@@ -101,7 +119,7 @@ func (p *Pool) evalElasticLocked(now time.Time) bool {
 		return false
 	}
 
-	win := e.Window.Duration()
+	win := elasticWindow(e)
 	from := now.Add(-win)
 	p.elastic.total.trim(from)
 	p.elastic.limited.trim(from)
@@ -171,11 +189,12 @@ func (p *Pool) elasticViewLocked(now time.Time) elasticView {
 	if !e.Enabled {
 		return v
 	}
-	p.elastic.total.trim(now.Add(-e.Window.Duration()))
-	p.elastic.limited.trim(now.Add(-e.Window.Duration()))
+	win := elasticWindow(&p.cfg.Batch.Elastic)
+	p.elastic.total.trim(now.Add(-win))
+	p.elastic.limited.trim(now.Add(-win))
 	v.hits = p.elastic.limited.len()
 	v.total = p.elastic.total.len()
-	v.window = int(e.Window.Duration() / time.Second)
+	v.window = int(win / time.Second)
 	if v.total > 0 {
 		v.ratio = float64(v.hits) / float64(v.total)
 	}
