@@ -254,7 +254,7 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 启动时并发探一遍所有启用的号（默认 4 并发），**探出坏号直接写进状态**，让第一波业务请求
 不必自己试错。只打 `/v1/models`，不消耗生成额度。
 
-实测：某次启动时两个号已被上游 `ACCOUNT_SUSPENDED` 冻结，预热直接判为 `exhausted`，
+实测：某次启动时两个号已被上游 `ACCOUNT_SUSPENDED` 冻结，预热直接判为 `blocked`（冻结），
 随后 3 个业务请求全部 `attempt=1` 一次成功。
 
 ---
@@ -268,10 +268,10 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 |---|---|---|---|
 | 2xx | — | 失败计数清零，回到 `active` | — |
 | 401 | `auth` | `invalid`，不自动恢复，需人工重置 | 是 |
-| 402 | `quota` | `exhausted`，冷却 `exhausted_cooldown` | 是 |
-| **403 + `ACCOUNT_SUSPENDED`** | `quota` | 同上（账号被冻结） | 是 |
+| 402 | `quota` | `exhausted`（余额不足），冷却 `exhausted_cooldown`，反复欠费按次数翻倍到 `_max` | 是 |
+| **403 + `ACCOUNT_SUSPENDED`** | `banned` | `blocked`（账号被冻结），冷却 `banned_cooldown` 起指数退避；**不计入 429 压力** | 是 |
 | **403 + `MODEL_ACCESS_DENIED`** | `model_denied` | **只封「号 × 模型」**，6h 起指数退避 | 是 |
-| 403 其它 | `quota` | 保守按冻结处理 | 是 |
+| 403 其它 | `quota` | 保守按欠费处理 | 是 |
 | **429 + `RATE_LIMITED`** | `rate` | `cooling`，按 `retryAfterSeconds` 精确冷却 | 是 |
 | **429 + `UPSTREAM_RATE_LIMITED`** | `upstream_rate` | **只冷「号 × 模型」**（30s），优先同号重试 | 是 |
 | 429 无标记 | `rate` | 同上，无提示时 20s 起指数退避 | 是 |
@@ -352,7 +352,7 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 - **日账一个请求只记一次**（重试不重复计费），但**日志每次尝试都留一条**，方便区分"贵"和"重试多"。
 - 日账按 `Asia/Shanghai` 切日（Dockerfile 里装了 tzdata，否则跨零点会算到前一天）。
 
-余额触底（`credit_floor`，默认 ¥0.5）后号码停止派单（`exhausted`）；
+余额触底（`credit_floor`，默认 ¥0.5）或上游回 402 后号码停止派单（`exhausted`）；
 面板里补一笔充值额（`POST /panel/api/keys/{id}/budget {delta}`）会自动复活。
 
 ---
@@ -492,7 +492,8 @@ GET    /panel/api/config                        # 运行时信息
 | `pool.max_in_flight_global` | 0 | 全池在途上限（0 = 不限） |
 | `pool.breaker_threshold` | 3 | 连续失败多少次熔断 |
 | `pool.rate_cooldown` / `_max` | 20s / 10m | 429 冷却起点与上限 |
-| `pool.exhausted_cooldown` | 30m | 402/冻结的冷却 |
+| `pool.exhausted_cooldown` / `_max` | 30m / 6h | 402 余额不足的冷却起点与上限（反复欠费按次数翻倍） |
+| `pool.banned_cooldown` / `_max` | 30m / 12h | 403 账号冻结的冷却起点与上限，与 429 分开 |
 | `pool.model_block_base` / `_max` | 6h / 24h | 模型级封禁的指数退避区间 |
 | `pool.model_rate_cooldown` | 30s | 供应链限流的 `(号, 模型)` 短冷 |
 | `pool.credit_floor` | 0.5 | 余额低于此值且模型收费则不派单（0 = 关闭） |

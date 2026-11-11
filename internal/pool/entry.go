@@ -20,8 +20,12 @@ const (
 	StateActive    State = "active"
 	StateCooling   State = "cooling"
 	StateInvalid   State = "invalid"   // 401，需人工/探活重置
-	StateExhausted State = "exhausted" // 402/冻结，冷却后自动重试
-	StateDisabled  State = "disabled"  // 人工摘号
+	StateExhausted State = "exhausted" // 402 余额不足，退避后自动重试
+	// StateBlocked 是 403 ACCOUNT_SUSPENDED：账号被平台冻结/封禁。
+	// 和 exhausted 分开是因为处置不同——欠费充钱就活，冻结只能等上游解封，
+	// 而且它绝不能被算成"429 压力"去触发弹性扩容（多开号救不了封号）。
+	StateBlocked  State = "blocked"
+	StateDisabled State = "disabled" // 人工摘号
 )
 
 // ModelBlock 是 (号, 模型) 维度的封禁/冷却。
@@ -62,6 +66,10 @@ type Key struct {
 	// RateStreak 是连续软限流次数（独立于熔断计数：429 是"配额用完"，
 	// 不该被 5xx 的熔断计数污染，也不该在熔断触发时被清零）。
 	RateStreak int `json:"rate_streak,omitempty"`
+	// QuotaHits / BanHits 是"欠费"与"被冻结"的连续命中次数，只用来放大退避。
+	// 不复用 RateStreak：同一个号又欠费又被限流时，两套节律互不污染。
+	QuotaHits int `json:"quota_hits,omitempty"`
+	BanHits   int `json:"ban_hits,omitempty"`
 	// 熔断与冷却解耦：冷却按错误类别给固定时长，熔断只对"反复失败"逐次加长。
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 	BreakerCount int       `json:"breaker_count,omitempty"`
@@ -109,7 +117,8 @@ func (k *Key) Masked() string {
 
 // usable 是账号级健康判定：不看模型。
 func (k *Key) usable(now time.Time) bool {
-	if !k.Enabled || k.State == StateDisabled || k.State == StateInvalid || k.State == StateExhausted {
+	if !k.Enabled || k.State == StateDisabled || k.State == StateInvalid ||
+		k.State == StateExhausted || k.State == StateBlocked {
 		return false
 	}
 	if !k.BreakerUntil.IsZero() && now.Before(k.BreakerUntil) {
@@ -185,33 +194,36 @@ func (k *Key) stateLabel() State {
 
 // View 是面板看到的号快照。
 type View struct {
-	ID               string       `json:"id"`
-	Name             string       `json:"name"`
-	Masked           string       `json:"masked"`
-	Enabled          bool         `json:"enabled"`
-	State            string       `json:"state"`
-	Weight           float64      `json:"weight"`
-	Budget           float64      `json:"budget"`
-	Spent            float64      `json:"spent"`
-	Balance          float64      `json:"balance"` // -1 = 未知
-	Requests         int64        `json:"requests"`
-	Errors           int64        `json:"errors"`
-	PromptTokens     int64        `json:"prompt_tokens"`
-	CompletionTokens int64        `json:"completion_tokens"`
-	FailStreak       int          `json:"fail_streak"`
-	CooldownLeft     int          `json:"cooldown_left"`
-	CooldownReason   string       `json:"cooldown_reason,omitempty"`
-	BreakerLeft      int          `json:"breaker_left"`
-	LastError        string       `json:"last_error"`
-	LastUsedAt       string       `json:"last_used_at"`
-	LastOKAt         string       `json:"last_ok_at"`
-	Inflight         int          `json:"inflight"`
-	StickyTasks      int          `json:"sticky_tasks"`
-	Share            float64      `json:"share"` // 消耗占比 0..1
-	WeightNow        float64      `json:"weight_now"`
-	InBatch          bool         `json:"in_batch"`
-	Sessions         int          `json:"sessions"`
-	ModelBlocks      []ModelBlock `json:"model_blocks"`
+	ID               string  `json:"id"`
+	Name             string  `json:"name"`
+	Masked           string  `json:"masked"`
+	Enabled          bool    `json:"enabled"`
+	State            string  `json:"state"`
+	Weight           float64 `json:"weight"`
+	Budget           float64 `json:"budget"`
+	Spent            float64 `json:"spent"`
+	Balance          float64 `json:"balance"` // -1 = 未知
+	Requests         int64   `json:"requests"`
+	Errors           int64   `json:"errors"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	FailStreak       int     `json:"fail_streak"`
+	// 连续欠费 / 冻结次数：决定退避已经放大到第几档，面板上解释"为什么冷却变长了"。
+	QuotaHits      int          `json:"quota_hits"`
+	BanHits        int          `json:"ban_hits"`
+	CooldownLeft   int          `json:"cooldown_left"`
+	CooldownReason string       `json:"cooldown_reason,omitempty"`
+	BreakerLeft    int          `json:"breaker_left"`
+	LastError      string       `json:"last_error"`
+	LastUsedAt     string       `json:"last_used_at"`
+	LastOKAt       string       `json:"last_ok_at"`
+	Inflight       int          `json:"inflight"`
+	StickyTasks    int          `json:"sticky_tasks"`
+	Share          float64      `json:"share"` // 消耗占比 0..1
+	WeightNow      float64      `json:"weight_now"`
+	InBatch        bool         `json:"in_batch"`
+	Sessions       int          `json:"sessions"`
+	ModelBlocks    []ModelBlock `json:"model_blocks"`
 }
 
 // Lease 是一次选号的结果。Release 必须调用一次，否则在途计数会永久泄漏。

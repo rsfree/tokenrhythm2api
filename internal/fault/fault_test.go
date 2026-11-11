@@ -25,7 +25,14 @@ func TestClassify(t *testing.T) {
 		{"402", 402, `{}`, Quota, true, false},
 		{"429 platform", 429, `{"code":"RATE_LIMITED"}`, Rate, true, false},
 		{"429 supply", 429, `{"code":"UPSTREAM_RATE_LIMITED"}`, UpstreamRate, true, true},
-		{"403 suspended", 403, `{"code":"ACCOUNT_SUSPENDED"}`, Rate, true, false},
+		{"403 suspended", 403, `{"code":"ACCOUNT_SUSPENDED"}`, Banned, true, false},
+		{"403 suspended 中文", 403, `{"code":"ACCOUNT_SUSPENDED","message":"账号已临时冻结"}`, Banned, true, false},
+		{"403 banned", 403, `{"code":"ACCOUNT_BANNED"}`, Banned, true, false},
+		// 线上真实返回：欠费
+		{"402 insufficient", 402, `{"code":"INSUFFICIENT_BALANCE","message":"账户余额不足，请充值后重试。"}`, Quota, true, false},
+		// 上游把"没钱"塞进 400/403 的情况也不能漏判成客户端错误
+		{"403 insufficient", 403, `{"code":"INSUFFICIENT_BALANCE","message":"账户余额不足"}`, Quota, true, false},
+		{"400 insufficient", 400, `{"code":"INSUFFICIENT_BALANCE"}`, Quota, true, false},
 		{"403 model denied", 403, `{"code":"MODEL_ACCESS_DENIED"}`, ModelDenied, true, true},
 		{"403 unknown", 403, `{"code":"WHATEVER"}`, Quota, true, false},
 		{"500", 500, `oops`, Upstream, true, false},

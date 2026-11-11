@@ -22,9 +22,13 @@ const (
 
 	// Client 是请求本身有问题（4xx 里认不出来的那些）：号没毛病，不重试。
 	Client Kind = "client"
-	// Rate 是本平台的次数配额（429 RATE_LIMITED / 403 ACCOUNT_SUSPENDED）：
-	// 罚号，按上游给的 retryAfter 精确冷却。
+	// Rate 是本平台的次数配额（429 RATE_LIMITED）：罚号，按上游给的
+	// retryAfter 精确冷却。多开号能加总配额，所以它算"扩容压力"。
 	Rate Kind = "rate"
+	// Banned 是账号被平台冻结/封禁（403 ACCOUNT_SUSPENDED）：这不是次数
+	// 配额，多开号也救不回一个被封的账号，只能换号 + 长退避等它自己解开。
+	// 因此它不计入 429 压力，也不该用 429 的秒级冷却反复去撞。
+	Banned Kind = "banned"
 	// UpstreamRate 是模型供应链侧限流（429 UPSTREAM_RATE_LIMITED）：
 	// 换号救不了，只对 (号, 模型) 短暂冷却，退避后优先同号重试。
 	UpstreamRate Kind = "upstream_rate"
@@ -55,7 +59,7 @@ type Verdict struct {
 //
 // 403 与 429 都必须看 body 才能判——同一个状态码，两种完全相反的意思：
 //
-//	403 ACCOUNT_SUSPENDED    账号被冻结     → 罚号、换号
+//	403 ACCOUNT_SUSPENDED    账号被冻结     → 长退避封号、换号（不计入 429 压力）
 //	403 MODEL_ACCESS_DENIED  模型未开通     → 只封这个模型，换号
 //	403 其它                 认不出来       → 按额度问题保守处理
 //	429 RATE_LIMITED         平台次数配额   → 罚号，按 retryAfter 冷却
@@ -79,14 +83,20 @@ func Classify(status int, body []byte, hdr http.Header) Verdict {
 
 	case status == http.StatusForbidden:
 		switch {
-		case HasAny(body, "ACCOUNT_SUSPENDED", "account_suspended"):
-			v.Kind, v.Retryable = Rate, true
+		case HasAny(body, "ACCOUNT_SUSPENDED", "account_suspended", "ACCOUNT_BANNED", "account_banned", "账号已临时冻结", "账号被冻结", "账号已冻结"):
+			v.Kind, v.Retryable = Banned, true
 			v.RetryAfter = RetryAfter(hdr, body)
 		case HasAny(body, "MODEL_ACCESS_DENIED", "model_access_denied", "灰度", "not enabled", "no permission"):
 			v.Kind, v.Retryable, v.ModelScoped = ModelDenied, true, true
 		default:
 			v.Kind, v.Retryable = Quota, true
 		}
+
+	// 有些上游把"没钱"塞进 400/403 返回，状态码认不出来但 body 说得很清楚。
+	// 漏了这一条，欠费号会被当成"客户端错误"——不罚号、不换号、每笔都白撞。
+	case status >= 400 && status < 500 &&
+		HasAny(body, "INSUFFICIENT_BALANCE", "insufficient_balance", "余额不足", "余额已用尽"):
+		v.Kind, v.Retryable = Quota, true
 
 	case status >= 500:
 		v.Kind, v.Retryable = Upstream, true

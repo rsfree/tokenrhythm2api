@@ -27,6 +27,9 @@
     "rate_cooldown": "20s",
     "rate_cooldown_max": "10m",
     "exhausted_cooldown": "30m",
+    "exhausted_cooldown_max": "6h",
+    "banned_cooldown": "30m",
+    "banned_cooldown_max": "12h",
 
     "model_block_base": "6h",
     "model_block_max": "24h",

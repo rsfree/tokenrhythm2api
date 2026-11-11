@@ -224,7 +224,7 @@ $('navToggle').addEventListener('click', () => $('nav').classList.toggle('open')
 
 const STATE_TEXT = {
   active: '可用', cooling: '冷却中', invalid: '密钥失效',
-  exhausted: '额度耗尽', disabled: '已停用',
+  exhausted: '余额耗尽', blocked: '账号已冻结', disabled: '已停用',
 };
 
 function stateBadge(k) {
@@ -634,6 +634,8 @@ function fillPoolForm(p) {
   $('pFloor').value = p.credit_floor ?? 0;
   $('pIdle').value = p.idle_weight_per_hour ?? 0;
   $('pRate').value = Math.round(parseDur(p.rate_cooldown));
+  $('pExhaust').value = Math.max(1, Math.round(parseDur(p.exhausted_cooldown) / 60) || 30);
+  $('pBan').value = Math.max(1, Math.round(parseDur(p.banned_cooldown) / 60) || 30);
   $('pBreaker').value = Math.round(parseDur(p.breaker_cooldown));
   $('pInflight').value = p.inflight_penalty ?? 3;
   const ss = p.session_sticky || {};
@@ -961,6 +963,8 @@ $('btnSavePool').addEventListener('click', async () => {
     credit_floor: parseFloat($('pFloor').value) || 0,
     idle_weight_per_hour: parseFloat($('pIdle').value) || 0,
     rate_cooldown: Math.round(parseFloat($('pRate').value) || 20) + 's',
+    exhausted_cooldown: Math.max(1, parseInt($('pExhaust').value, 10) || 30) + 'm',
+    banned_cooldown: Math.max(1, parseInt($('pBan').value, 10) || 30) + 'm',
     breaker_cooldown: Math.round(parseFloat($('pBreaker').value) || 30) + 's',
     inflight_penalty: parseFloat($('pInflight').value) || 3,
     session_sticky: {

@@ -295,7 +295,7 @@ func (s *Scheduler) markByError(id string, err error) {
 	}
 	v := fault.Classify(se.Status, se.Body, nil)
 	switch v.Kind {
-	case fault.Auth, fault.Quota, fault.Rate:
+	case fault.Auth, fault.Quota, fault.Rate, fault.Banned:
 		s.d.Pool.MarkFail(id, pool.Outcome{Kind: v.Kind, Message: v.Message, RetryAfter: v.RetryAfter})
 	}
 }

@@ -103,7 +103,8 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	for _, v := range views {
 		totalSpent += v.Spent
 		totalBudget += v.Budget
-		if v.Enabled && (v.State == "active" || v.State == "cooling") {
+		// 冷却中且没到期的不算"可用"：面板上的可用数要能直接对上"派单能落到几个号"。
+		if v.Enabled && (v.State == "active" || (v.State == "cooling" && v.CooldownLeft <= 0)) {
 			healthy++
 		}
 	}

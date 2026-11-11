@@ -7,6 +7,7 @@
   ..._four    glm-5.1 上 403 MODEL_ACCESS_DENIED，其它模型 200
   ..._rateN   429 按号限流（演示弹性扩窗：这类号越多，429 占比越高）
   ..._drain   402 额度不足（演示"一个号没钱了，窗口自动补一个"）
+  ..._susp    403 ACCOUNT_SUSPENDED 账号冻结（演示"冻结号长退避、不算 429 压力"）
 """
 import json
 import random
@@ -112,6 +113,9 @@ class H(BaseHTTPRequestHandler):
         if tag.startswith("drain"):
             return self._json(402, {"error": {"code": "INSUFFICIENT_BALANCE",
                                               "message": "账号额度不足，请充值"}})
+        if tag.startswith("susp"):
+            return self._json(403, {"error": {"code": "ACCOUNT_SUSPENDED",
+                                              "message": "账号已临时冻结"}})
         if tag == "three" or tag.startswith("rate"):
             return self._json(429, {"error": {"code": "RATE_LIMITED",
                                               "message": "该账号本窗口请求数已达上限"}},

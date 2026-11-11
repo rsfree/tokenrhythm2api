@@ -93,7 +93,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handleHealth 给负载均衡/宿主探活用。永远 200：进程活着就是活着；
 // 号池健康度放在字段里，不拿 503 让编排系统去重启一个"只是暂时没号"的进程。
 func (s *Server) handleHealth(w http.ResponseWriter) {
-	total, healthy, cooling, invalid, exhausted, disabled := s.d.Pool.Counts()
+	total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
 	st := s.d.Pool.BatchState()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
@@ -104,6 +104,7 @@ func (s *Server) handleHealth(w http.ResponseWriter) {
 		"cooling":        cooling,
 		"invalid":        invalid,
 		"exhausted":      exhausted,
+		"blocked":        blocked,
 		"disabled":       disabled,
 		"inflight":       st.TotalInflight,
 		"uptime_seconds": int64(s.Uptime().Seconds()),
@@ -117,7 +118,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", "管理令牌无效")
 		return
 	}
-	total, healthy, _, _, _, _ := s.d.Pool.Counts()
+	total, healthy, _, _, _, _, _ := s.d.Pool.Counts()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"service":  "trpool",

@@ -45,6 +45,8 @@ func (p *Pool) Release(l *Lease, o Outcome) {
 	if o.Kind == fault.None {
 		k.FailStreak = 0
 		k.RateStreak = 0
+		k.QuotaHits = 0
+		k.BanHits = 0
 		k.BreakerUntil = time.Time{}
 		k.BreakerCount = 0
 		k.CooldownUntil = time.Time{}
@@ -65,9 +67,9 @@ func (p *Pool) Release(l *Lease, o Outcome) {
 	k.Errors++
 	k.LastError = truncate(o.Message, 240)
 	k.LastErrorAt = now
-	p.applyFailLocked(k, o, now)
+	p.applyFailLocked(k, o, now, true)
 	// 只有"按号限流"算压力：多开号能加总配额。
-	// 模型侧限流是全池共享的上游瓶颈，欠费/失效则应该补号而不是扩窗。
+	// 模型侧限流是全池共享的上游瓶颈；欠费/冻结/失效则应该补号或换号，扩窗没用。
 	p.observe(now, o.Kind == fault.Rate)
 	p.evalElasticLocked(now)
 	p.refreshBatchLocked(now)
@@ -89,7 +91,9 @@ func (p *Pool) MarkFail(id string, o Outcome) {
 	k.Errors++
 	k.LastError = truncate(o.Message, 240)
 	k.LastErrorAt = time.Now()
-	p.applyFailLocked(k, o, time.Now())
+	// 探活不是业务流量：不放大退避（否则每点一次"探活"就把冻结号的
+	// 冷却翻倍，越探越久），但仍然要让状态立刻生效。
+	p.applyFailLocked(k, o, time.Now(), false)
 	// 探活/预热不算业务流量，不进 429 占比的样本；
 	// 但号刚被判定不可用时，窗口要立刻补一个上来。
 	p.refreshBatchLocked(time.Now())
@@ -153,7 +157,10 @@ func (p *Pool) ReenableIfCredits(id string) {
 }
 
 // applyFailLocked 是状态转移的唯一权威实现。
-func (p *Pool) applyFailLocked(k *Key, o Outcome, now time.Time) {
+//
+// escalate 表示"这一笔算业务流量、要把退避次数 +1"。探活/预热传 false：
+// 它们的目的是验证"好了没有"，不该因为多探了几次就把号关得更久。
+func (p *Pool) applyFailLocked(k *Key, o Outcome, now time.Time, escalate bool) {
 	switch o.Kind {
 	case fault.Client:
 		// 请求本身有问题，号没毛病：只记 last_error，不动状态。
@@ -165,9 +172,31 @@ func (p *Pool) applyFailLocked(k *Key, o Outcome, now time.Time) {
 		k.CooldownReason = "密钥失效（401）"
 
 	case fault.Quota:
+		// 余额不足：充钱就能活，所以不是"永久报废"，但也不能每 30 分钟
+		// 拉回来撞一次——100 个号 99 个没钱时，那会变成每半小时一轮的
+		// 无效请求波。按连续欠费次数指数放大，封顶 ExhaustedMax。
+		if escalate {
+			k.QuotaHits++
+		}
+		d := backoffDur(p.cfg.ExhaustedCooldown.Duration(), p.cfg.ExhaustedMax.Duration(), k.QuotaHits)
 		k.State = StateExhausted
-		k.CooldownUntil = now.Add(p.cfg.ExhaustedCooldown.Duration())
-		k.CooldownReason = firstNonEmpty(o.Message, "额度不足（402）")
+		k.CooldownUntil = now.Add(d)
+		k.CooldownReason = firstNonEmpty(o.Message, "余额不足（402）")
+
+	case fault.Banned:
+		// 403 ACCOUNT_SUSPENDED：账号级冻结。换号有意义（Retryable），
+		// 但这个号只能等上游解封，按更长档位退避。
+		if escalate {
+			k.BanHits++
+		}
+		d := backoffDur(p.cfg.BannedCooldown.Duration(), p.cfg.BannedMax.Duration(), k.BanHits)
+		// 上游明确给了恢复时间就至少等那么久（冻结类错误很少给，给了就别浪费）。
+		if o.RetryAfter > d {
+			d = o.RetryAfter
+		}
+		k.State = StateBlocked
+		k.CooldownUntil = now.Add(d)
+		k.CooldownReason = firstNonEmpty(o.Message, "账号被冻结（403）")
 
 	case fault.Rate:
 		// 上游给了恢复时间就照它来；只有"没给"的时候才指数退避。
@@ -288,4 +317,26 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// backoffDur 按命中次数指数放大冷却：hits<=1 用起点，2 倍、4 倍…到 max 截断。
+// hits 会随"欠费/冻结"次数累积，只在成功后清零，所以稳定欠费的号会越来越安静。
+func backoffDur(base, max time.Duration, hits int) time.Duration {
+	if base <= 0 {
+		base = 30 * time.Second
+	}
+	if hits < 1 {
+		hits = 1
+	}
+	d := base
+	for i := 1; i < hits && i <= 8; i++ {
+		d *= 2
+		if max > 0 && d >= max {
+			return max
+		}
+	}
+	if max > 0 && d > max {
+		d = max
+	}
+	return d
 }

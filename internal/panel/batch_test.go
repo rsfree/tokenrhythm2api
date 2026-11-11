@@ -109,7 +109,7 @@ func TestPanelBatchAdd(t *testing.T) {
 	if got.Results[3].Error == "" || got.Results[4].Error == "" {
 		t.Errorf("重复密钥与非法密钥都要给出原因: %+v", got.Results)
 	}
-	if total, _, _, _, _, _ := h.pool.Counts(); total != 3 {
+	if total, _, _, _, _, _, _ := h.pool.Counts(); total != 3 {
 		t.Errorf("池内 %d 个号，想要 3", total)
 	}
 	// 统一充值额落到了每个号上

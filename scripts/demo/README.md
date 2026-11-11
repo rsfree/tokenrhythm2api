@@ -34,7 +34,8 @@ python scripts/demo/drive.py
 | 后缀 | 行为 | 面板上能看到什么 |
 |---|---|---|
 | `..._rateN` | 恒 429 `RATE_LIMITED` | 号级冷却 + 弹性扩容被触发 |
-| `..._drainN` | 恒 402 `INSUFFICIENT_BALANCE` | 号转「额度不足」，窗口**当场补一个**上来 |
+| `..._drainN` | 恒 402 `INSUFFICIENT_BALANCE` | 号转「余额耗尽」，窗口**当场补一个**上来；反复欠费则退避翻倍 |
+| `..._susp` | 恒 403 `ACCOUNT_SUSPENDED` | 号转「账号已冻结」，长退避；**不计入 429 压力**，不会顶起弹性 |
 
 ## 演示活跃窗口 + 弹性扩容
 

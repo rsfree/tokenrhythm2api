@@ -48,7 +48,7 @@ func TestAddManyPartialSuccess(t *testing.T) {
 		t.Errorf("批内重复的提示应指向首行，得到 %q", got)
 	}
 	// 失败的行不能把别人的槽位顶掉
-	if total, _, _, _, _, _ := p.Counts(); total != 4 {
+	if total, _, _, _, _, _, _ := p.Counts(); total != 4 {
 		t.Errorf("池内共 %d 个号，想要 4 个", total)
 	}
 	// 6 条只通知一次，否则 100 个号要触发 100 次落盘
@@ -74,7 +74,7 @@ func TestAddManyAllBadNoNotify(t *testing.T) {
 	if notify != 0 {
 		t.Errorf("一个号都没加进来，不该通知落盘（触发了 %d 次）", notify)
 	}
-	if total, _, _, _, _, _ := p.Counts(); total != 0 {
+	if total, _, _, _, _, _, _ := p.Counts(); total != 0 {
 		t.Errorf("池子应为空，实有 %d 个", total)
 	}
 }

@@ -297,7 +297,7 @@ func TestAuthAndQuotaStates(t *testing.T) {
 	for _, id := range []string{a.ID, b.ID} {
 		p.Reset(id)
 	}
-	if total, healthy, _, _, _, _ := p.Counts(); total != 2 || healthy != 2 {
+	if total, healthy, _, _, _, _, _ := p.Counts(); total != 2 || healthy != 2 {
 		t.Fatalf("重置后应全部健康，实际 total=%d healthy=%d", total, healthy)
 	}
 }

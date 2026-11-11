@@ -165,8 +165,16 @@ type PoolConfig struct {
 	RateCooldown Duration `json:"rate_cooldown"`
 	RateMax      Duration `json:"rate_cooldown_max"`
 
-	// 402/403（账号冻结）判为额度类问题后的冷却
+	// 402 余额耗尽的冷却起点与上限。同一个号反复欠费就按次数指数放大：
+	// 刚欠费 30 分钟才重试一次，一直不充就退到 6 小时才碰一次。
 	ExhaustedCooldown Duration `json:"exhausted_cooldown"`
+	ExhaustedMax      Duration `json:"exhausted_cooldown_max"`
+
+	// 403 账号冻结（ACCOUNT_SUSPENDED）：与限流分开，长退避。
+	// 冻结是账号级处置，秒级/分钟级重试只会白撞，而且会把"429 压力"
+	// 顶起来误触弹性扩容。
+	BannedCooldown Duration `json:"banned_cooldown"`
+	BannedMax      Duration `json:"banned_cooldown_max"`
 
 	// 模型级封禁（403 MODEL_ACCESS_DENIED）：只封"这个号 + 这个模型"，
 	// 指数退避，成功一次即解除。换号通常能救，所以不罚整个号。
@@ -300,6 +308,9 @@ func Default() Config {
 			RateCooldown:      Duration(20 * time.Second),
 			RateMax:           Duration(10 * time.Minute),
 			ExhaustedCooldown: Duration(30 * time.Minute),
+			ExhaustedMax:      Duration(6 * time.Hour),
+			BannedCooldown:    Duration(30 * time.Minute),
+			BannedMax:         Duration(12 * time.Hour),
 			ModelBlockBase:    Duration(6 * time.Hour),
 			ModelBlockMax:     Duration(24 * time.Hour),
 			ModelRateCooldown: Duration(30 * time.Second),
@@ -452,6 +463,21 @@ func (c *Config) normalize() {
 	}
 	if p.ExhaustedCooldown.Duration() <= 0 {
 		p.ExhaustedCooldown = Duration(30 * time.Minute)
+	}
+	if p.ExhaustedMax.Duration() <= 0 {
+		p.ExhaustedMax = Duration(6 * time.Hour)
+	}
+	if p.ExhaustedMax.Duration() < p.ExhaustedCooldown.Duration() {
+		p.ExhaustedMax = p.ExhaustedCooldown
+	}
+	if p.BannedCooldown.Duration() <= 0 {
+		p.BannedCooldown = Duration(30 * time.Minute)
+	}
+	if p.BannedMax.Duration() <= 0 {
+		p.BannedMax = Duration(12 * time.Hour)
+	}
+	if p.BannedMax.Duration() < p.BannedCooldown.Duration() {
+		p.BannedMax = p.BannedCooldown
 	}
 	if p.ModelBlockBase.Duration() <= 0 {
 		p.ModelBlockBase = Duration(6 * time.Hour)

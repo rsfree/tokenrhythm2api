@@ -242,6 +242,9 @@ func (p *Pool) Update(id string, name, secret *string, weight, budget *float64, 
 			k.CooldownUntil = time.Time{}
 			k.CooldownReason = ""
 			k.FailStreak = 0
+			k.RateStreak = 0
+			k.QuotaHits = 0
+			k.BanHits = 0
 			k.BreakerUntil = time.Time{}
 			k.BreakerCount = 0
 			k.ModelBlocks = nil
@@ -304,6 +307,9 @@ func (p *Pool) Reset(id string) bool {
 	k.CooldownUntil = time.Time{}
 	k.CooldownReason = ""
 	k.FailStreak = 0
+	k.RateStreak = 0
+	k.QuotaHits = 0
+	k.BanHits = 0
 	k.BreakerUntil = time.Time{}
 	k.BreakerCount = 0
 	k.ModelBlocks = nil
@@ -417,7 +423,7 @@ func (p *Pool) Tick() {
 	now := time.Now()
 	changed := false
 	for _, k := range p.keys {
-		if (k.State == StateCooling || k.State == StateExhausted) &&
+		if (k.State == StateCooling || k.State == StateExhausted || k.State == StateBlocked) &&
 			!k.CooldownUntil.IsZero() && !now.Before(k.CooldownUntil) {
 			k.State = StateActive
 			k.CooldownUntil = time.Time{}
@@ -487,7 +493,7 @@ func (p *Pool) EnabledKeys() []View {
 	return out
 }
 
-func (p *Pool) Counts() (total, healthy, cooling, invalid, exhausted, disabled int) {
+func (p *Pool) Counts() (total, healthy, cooling, invalid, exhausted, blocked, disabled int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -500,6 +506,8 @@ func (p *Pool) Counts() (total, healthy, cooling, invalid, exhausted, disabled i
 			invalid++
 		case k.State == StateExhausted:
 			exhausted++
+		case k.State == StateBlocked:
+			blocked++
 		case k.usable(now):
 			healthy++
 		case k.State == StateCooling:
@@ -618,6 +626,7 @@ func (p *Pool) Views() []View {
 			Requests: k.Requests, Errors: k.Errors,
 			PromptTokens: k.PromptTokens, CompletionTokens: k.CompletionTokens,
 			FailStreak: k.FailStreak, LastError: k.LastError,
+			QuotaHits: k.QuotaHits, BanHits: k.BanHits,
 			Inflight: k.inflight, WeightNow: p.weightOf(k, now),
 			InBatch: inBatch[id], Sessions: sessByKey[id],
 			StickyTasks: stickyByKey[id], CooldownReason: k.CooldownReason,
@@ -632,7 +641,7 @@ func (p *Pool) Views() []View {
 		if !k.LastOKAt.IsZero() {
 			v.LastOKAt = k.LastOKAt.Format(time.RFC3339)
 		}
-		if k.State == StateCooling || k.State == StateExhausted {
+		if k.State == StateCooling || k.State == StateExhausted || k.State == StateBlocked {
 			if d := int(k.CooldownUntil.Sub(now).Seconds()); d > 0 {
 				v.CooldownLeft = d
 			}

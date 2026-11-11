@@ -208,7 +208,7 @@ func (p *Pool) fallbackLocked(req PickRequest, now time.Time) *Lease {
 			continue
 		}
 		switch k.State {
-		case StateDisabled, StateInvalid, StateExhausted:
+		case StateDisabled, StateInvalid, StateExhausted, StateBlocked:
 			continue
 		}
 		if p.inflightFull(k) || p.floorBlocked(k, req.Paid) {
@@ -354,7 +354,9 @@ func (p *Pool) blockReasonLocked(model string, now time.Time) string {
 		case k.State == StateInvalid:
 			counts["失效(401)"]++
 		case k.State == StateExhausted:
-			counts["额度耗尽"]++
+			counts["余额耗尽"]++
+		case k.State == StateBlocked:
+			counts["账号已冻结"]++
 		case !k.BreakerUntil.IsZero() && now.Before(k.BreakerUntil):
 			counts["熔断中"]++
 		case k.State == StateCooling && now.Before(k.CooldownUntil):
@@ -374,7 +376,7 @@ func (p *Pool) blockReasonLocked(model string, now time.Time) string {
 	}
 
 	parts := make([]string, 0, len(counts))
-	for _, name := range []string{"失效(401)", "额度耗尽", "冷却中", "熔断中", "在途已满", "该模型被封禁", "暂不可用"} {
+	for _, name := range []string{"失效(401)", "账号已冻结", "余额耗尽", "冷却中", "熔断中", "在途已满", "该模型被封禁", "暂不可用"} {
 		if n := counts[name]; n > 0 {
 			parts = append(parts, fmt.Sprintf("%d 个%s", n, name))
 		}
