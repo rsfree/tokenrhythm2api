@@ -312,6 +312,24 @@
             <p class="hint">保存会立即热更新调度器，并写回 <code>config.json</code> 的 <code>pool</code> 段（密钥永不落盘）。</p>
           </section>
 
+          <section class="panel">
+            <div class="panel-head">
+              <h2>探活</h2>
+              <div class="panel-actions"><button class="btn small" id="btnSaveProbe">保存并生效</button></div>
+            </div>
+            <div class="grid-form" id="probeForm">
+              <label>探活模型
+                <input type="text" id="probeModel" placeholder="留空 = 只拉 /v1/models（免费，但看不出欠费/冻结）">
+              </label>
+              <label>max_tokens<input type="number" id="probeMaxTokens" min="1" max="64"></label>
+            </div>
+            <p class="hint">
+              填了模型才会<strong>真跑一次生成</strong>（<code>max_tokens</code> 个 token，按价目表计费）——
+              只有这样才能验出「欠费 402 / 冻结 403」。<code>/v1/models</code> 是免费端点，
+              <strong>欠费号也返回 200</strong>，用它探活会把刚停用的号又放回可用。
+            </p>
+          </section>
+
           <div class="cols">
             <section class="panel">
               <div class="panel-head"><h2>运行时</h2></div>

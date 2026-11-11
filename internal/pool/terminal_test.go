@@ -173,6 +173,33 @@ func TestProbeOKDoesNotTouchDisabled(t *testing.T) {
 	}
 }
 
+// MarkAuthOK 是"只证明密钥有效"的探活（GET /v1/models）：清 invalid，但绝不动停用号。
+//
+// 欠费号拉模型列表也是 200。如果这条被放宽，面板上就会重新出现
+// "余额不足却显示可用"，然后每一笔业务请求都白撞一次 402。
+func TestMarkAuthOKOnlyClearsInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		fail Outcome
+		want State
+	}{
+		{"欠费停用", Outcome{Kind: fault.Quota, Message: "402 INSUFFICIENT_BALANCE"}, StateExhausted},
+		{"账号冻结", Outcome{Kind: fault.Banned, Message: "403 ACCOUNT_SUSPENDED"}, StateBlocked},
+		{"密钥失效", Outcome{Kind: fault.Auth, Message: "401 UNAUTHORIZED"}, StateActive},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := testPool(t, nil)
+			k := addKey(t, p, "a", 0)
+			p.MarkFail(k.ID, c.fail)
+			p.MarkAuthOK(k.ID)
+			if got := p.keys[k.ID].State; got != c.want {
+				t.Fatalf("状态 = %s, 想要 %s", got, c.want)
+			}
+		})
+	}
+}
+
 // 补额度是欠费号的恢复通道：钱到了就不用人工再点一次。
 func TestAddBudgetRevivesExhausted(t *testing.T) {
 	p := testPool(t, nil)

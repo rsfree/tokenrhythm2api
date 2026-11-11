@@ -16,6 +16,20 @@ type Snapshot struct {
 	ClientKeys       []string
 	AllowPassthrough bool
 	LogBodies        bool
+
+	// ProbeModel 是探活用的模型。空 = 只打 GET /v1/models（免费，但看不出欠费/冻结）；
+	// 非空 = 真跑一次 max_tokens 个 token 的生成，才能验出 402/403。
+	ProbeModel     string
+	ProbeMaxTokens int
+}
+
+// Probe 返回探活参数，缺省 max_tokens=1。
+func (s Snapshot) Probe() (model string, maxTokens int) {
+	maxTokens = s.ProbeMaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1
+	}
+	return strings.TrimSpace(s.ProbeModel), maxTokens
 }
 
 // Holder 原子持有当前快照。

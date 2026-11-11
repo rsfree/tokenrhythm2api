@@ -251,6 +251,26 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 `min_pick_gap`（默认 100ms）内同一个号不会被重复选中，避免一波并发全砸在同一个号上；
 全部号都刚用过时按 LRU（单调 `seq`）兜底，不会返回"没有可用号"。
 
+### 探活（模型可配置）
+
+探活分两种打法，由 `auto_probe.model` 决定（面板「配置 → 探活」可在线改）：
+
+| `auto_probe.model` | 打什么 | 能证明什么 | 成功后的后果 |
+|---|---|---|---|
+| 空 | `GET /v1/models` | 只证明**密钥有效**（401 过去了） | 只清 `invalid`（`MarkAuthOK`），**不动** `exhausted`/`blocked` |
+| 非空（默认 `glm-5.3-flash`） | `POST /v1/chat/completions`，`max_tokens=1` | 真跑通一次生成：**有钱、模型通** | 可以复活 `invalid`/`exhausted`/`blocked`（`MarkOK`） |
+
+**这一条是「明明欠费却显示可用」的根因**：`/v1/models` 是免费端点，欠费号也返回 200，
+老实现用它探活成功就 `MarkOK`，于是刚因 402 停用的号被一次探活又放回可用，
+下一笔业务请求再撞一次 402。
+
+所以现在只有**真跑一次生成**才能当"这个号能用"的证据。探活撞到 402/403 会照常
+`MarkFail` 把号停掉；探活模型没在该号上开通（`MODEL_ACCESS_DENIED`）则**不罚号**，
+只提示"探活模型可能填错了"——那是配置问题，不是号坏了。
+
+自动探活只扫 `invalid` 号（`cooling` 按时间自愈，`exhausted`/`blocked` 只能人工恢复），
+所以它不会把停用号偷偷放回来。
+
 ### 预热
 
 启动时并发探一遍所有启用的号（默认 4 并发），**探出坏号直接写进状态**，让第一波业务请求
@@ -320,9 +340,14 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 |---|---|
 | 充值后 | 补额度（`POST /panel/api/keys/{id}/budget`）→ 欠费号自动恢复 |
 | 批量充值后 | 号池右上「恢复停用号」（`POST /panel/api/keys/revive`）一次放回来 |
-| 确认已解封 | 单号「探活」成功，或「重置」 |
+| 确认已解封 | 单号「探活」成功（需配了探活模型，见下），或「重置」 |
 
 冻结号（`blocked`）不会被补额度解开——那是上游的处罚，充钱没用；人工停用的号也不会被探活放回来。
+
+> ⚠️ **探活必须配模型才算数**：`auto_probe.model` 为空时探活只打 `GET /v1/models`，
+> 欠费／冻结的号照样 200，所以它只能证明密钥有效、**不会**把停用号放回可用
+> （`MarkAuthOK` 只清 `invalid`）。想让「探活」成为恢复通道，就在
+> 面板「配置 → 探活」填一个模型（默认 `glm-5.3-flash`），它会真跑一次 `max_tokens` 个 token 的生成。
 
 ### 重试边界
 
@@ -485,6 +510,7 @@ POST   /panel/api/keys/{id}/budget  {delta}     # 调整充值额（¥）
 DELETE /panel/api/keys/{id}/models?model=xxx    # 解除单模型封禁
 POST   /panel/api/keys/probe                    # 全池探活（跳过人工停用的号）
 POST   /panel/api/keys/revive                   # 批量恢复因欠费/冻结停用的号
+PUT    /panel/api/probe                         # 改探活模型 {model?, max_tokens?}（空 = 只拉 /v1/models）
 PUT    /panel/api/pool                          # 热更新调度参数
 POST   /panel/api/prices                        # 刷新价目表
 GET    /panel/api/config                        # 运行时信息
@@ -536,7 +562,9 @@ GET    /panel/api/config                        # 运行时信息
 | `logging.ring_size` | 400 | 内存日志条数 |
 | `logging.request_archive` | true | JSONL 归档开关 |
 | `logging.retention_days` / `request_archive_max_mb` | 7 / 100 | 归档淘汰阈值 |
-| `auto_probe.interval` | 2m | 对 `cooling`/`invalid` 号的探活间隔 |
+| `auto_probe.interval` | 2m | 自动探活间隔（只扫 `invalid` 号） |
+| `auto_probe.model` | `glm-5.3-flash` | 探活模型：留空只拉 `/v1/models`（看不出欠费/冻结），填了就真跑一次生成 |
+| `auto_probe.max_tokens` | 1 | 探活生成的 token 上限 |
 | `prices.refresh_interval` | 10m | 价目表刷新间隔 |
 
 ---

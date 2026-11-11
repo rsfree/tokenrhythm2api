@@ -248,12 +248,19 @@ func (l LoggingConfig) ArchiveOn() bool {
 	return *l.RequestArchive
 }
 
-// ProbeConfig 是自动探活。
+// ProbeConfig 是探活（自动 + 面板手动）的配置。
 type ProbeConfig struct {
 	Enabled     bool     `json:"enabled"`
 	Interval    Duration `json:"interval"`
 	Timeout     Duration `json:"timeout"`
 	Concurrency int      `json:"concurrency"`
+
+	// Model 是探活用的模型。空 = 只打 GET /v1/models：免费，但只能证明密钥有效，
+	// 证明不了"有钱、模型通"——欠费号拉模型列表照样 200，拿它探活会把刚停用的号
+	// 又放回可用。填上模型才会真跑一次 max_tokens 个 token 的生成。
+	Model string `json:"model"`
+	// MaxTokens 是探活生成的 token 上限，默认 1。
+	MaxTokens int `json:"max_tokens"`
 }
 
 // PriceConfig 是价目表刷新。
@@ -345,6 +352,10 @@ func Default() Config {
 			Interval:    Duration(2 * time.Minute),
 			Timeout:     Duration(15 * time.Second),
 			Concurrency: 4,
+			// 默认给一个便宜的小模型：不给的话探活只能打 /v1/models，
+			// 欠费号也会显示可用（面板上那个"明明欠费却还是可用"就是这么来的）。
+			Model:     "glm-5.3-flash",
+			MaxTokens: 1,
 		},
 		Prices: PriceConfig{RefreshInterval: Duration(10 * time.Minute)},
 	}
@@ -512,6 +523,13 @@ func (c *Config) normalize() {
 	if c.AutoProbe.Concurrency <= 0 {
 		c.AutoProbe.Concurrency = 4
 	}
+	c.AutoProbe.Model = strings.TrimSpace(c.AutoProbe.Model)
+	if c.AutoProbe.MaxTokens <= 0 {
+		c.AutoProbe.MaxTokens = 1
+	}
+	if c.AutoProbe.MaxTokens > 64 {
+		c.AutoProbe.MaxTokens = 64
+	}
 	if c.Prices.RefreshInterval.Duration() <= 0 {
 		c.Prices.RefreshInterval = Duration(10 * time.Minute)
 	}
@@ -531,6 +549,16 @@ func (c Config) Validate() error {
 // WritePool 把调度参数写回 config.json 的 pool 段，保留其它未知键与密钥。
 // 文件不存在时不做任何事（不新建，避免把内存里的密钥落盘）。
 func WritePool(path string, pool PoolConfig) error {
+	return writeSection(path, "pool", pool)
+}
+
+// WriteAutoProbe 只替换配置文件里的 auto_probe 段（面板改探活模型时用）。
+func WriteAutoProbe(path string, probe ProbeConfig) error {
+	return writeSection(path, "auto_probe", probe)
+}
+
+// writeSection 把 json 里某一个顶层段整体替换掉，其余段原样保留。
+func writeSection(path, key string, v any) error {
 	if path == "" {
 		return nil
 	}
@@ -542,11 +570,11 @@ func WritePool(path string, pool PoolConfig) error {
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return fmt.Errorf("配置文件不是合法 JSON: %w", err)
 	}
-	blk, err := json.MarshalIndent(pool, "", "  ")
+	blk, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	top["pool"] = blk
+	top[key] = blk
 	out, err := json.MarshalIndent(top, "", "  ")
 	if err != nil {
 		return err

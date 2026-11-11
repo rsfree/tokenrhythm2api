@@ -85,6 +85,8 @@ func main() {
 		ClientKeys:       cfg.ClientKeys,
 		AllowPassthrough: cfg.AllowUpstreamKeyPassthrough,
 		LogBodies:        cfg.Logging.LogBodies,
+		ProbeModel:       cfg.AutoProbe.Model,
+		ProbeMaxTokens:   cfg.AutoProbe.MaxTokens,
 	})
 	prices := usage.NewPrices()
 	daily := usage.NewDaily()
@@ -107,6 +109,7 @@ func main() {
 	sch := scheduler.New(scheduler.Deps{
 		Cfg: &cfg, Pool: p, Up: up, Prices: prices, Log: logs, Daily: daily,
 		StatePath: scheduler.DefaultStatePath(cfg.DataDir),
+		Live:      live,
 	})
 	if err := sch.Load(); err != nil {
 		log.Printf("WARN: %v", err)

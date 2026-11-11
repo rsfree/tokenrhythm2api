@@ -19,6 +19,7 @@ import (
 
 	"trpool/internal/config"
 	"trpool/internal/fault"
+	"trpool/internal/livecfg"
 	"trpool/internal/pool"
 	"trpool/internal/reqlog"
 	"trpool/internal/upstream"
@@ -40,6 +41,8 @@ type Deps struct {
 	Log       *reqlog.Recorder
 	Daily     *usage.Daily
 	StatePath string
+	// Live 提供在线可改的探活参数（探活模型 / max_tokens）。
+	Live *livecfg.Holder
 }
 
 type Scheduler struct {
@@ -220,7 +223,8 @@ func (s *Scheduler) Warmup(ctx context.Context) {
 }
 
 // ProbeInvalid 只探 invalid（401 判死）的号：探通了说明密钥又能用了。
-// cooling/exhausted 是按时间恢复的，不该被一次 /v1/models 提前放行。
+// cooling/exhausted/blocked 不在自动探活范围内——欠费/冻结是终态，
+// 只允许人工「探活」「恢复」把它们放回来，不能让定时任务自动复活。
 func (s *Scheduler) ProbeInvalid(ctx context.Context) {
 	if s.d.Prices.Count() == 0 {
 		s.RefreshPrices(ctx)
@@ -228,6 +232,11 @@ func (s *Scheduler) ProbeInvalid(ctx context.Context) {
 	timeout := s.d.Cfg.AutoProbe.Timeout.Duration()
 	if timeout <= 0 {
 		timeout = 20 * time.Second
+	}
+	// 探活模型可在线配置：配了就真跑一次生成（能验出欠费/冻结），没配只打 /v1/models。
+	model, maxTokens := "", 1
+	if s.d.Live != nil {
+		model, maxTokens = s.d.Live.Load().Probe()
 	}
 	for _, v := range s.d.Pool.Views() {
 		if !v.Enabled || v.State != "invalid" {
@@ -238,15 +247,30 @@ func (s *Scheduler) ProbeInvalid(ctx context.Context) {
 			continue
 		}
 		c, cancel := context.WithTimeout(ctx, timeout)
-		_, err := s.d.Up.FetchModels(c, secret)
+		err := s.probe(c, secret, model, maxTokens)
 		cancel()
 		if err == nil {
-			s.d.Pool.MarkOK(v.ID)
+			if model == "" {
+				// 只证明密钥有效：不能顺手复活欠费/冻结的号。
+				s.d.Pool.MarkAuthOK(v.ID)
+			} else {
+				s.d.Pool.MarkOK(v.ID)
+			}
 			log.Printf("探活成功，号 %s 已恢复", v.Name)
 			continue
 		}
 		s.markByError(v.ID, err)
 	}
+}
+
+// probe 按配置打一次探活请求：配了模型就真跑生成，没配只拉 /v1/models。
+func (s *Scheduler) probe(ctx context.Context, secret, model string, maxTokens int) error {
+	if model == "" {
+		_, err := s.d.Up.FetchModels(ctx, secret)
+		return err
+	}
+	_, err := s.d.Up.ProbeChat(ctx, secret, model, maxTokens)
+	return err
 }
 
 // RefreshPrices 用第一个能用的号拉 /v1/models，更新价目表。

@@ -56,6 +56,7 @@ func New(d Deps) *Panel {
 	// 比 "/panel/api/keys/" 这个子树更具体，ServeMux 会优先匹配到它
 	p.mux.HandleFunc("/panel/api/keys/batch", p.guard(p.handleKeysBatch))
 	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
+	p.mux.HandleFunc("/panel/api/probe", p.guard(p.handleProbeConfig))
 	p.mux.HandleFunc("/panel/api/keys/revive", p.guard(p.handleReviveStopped))
 	p.mux.HandleFunc("/panel/api/keys/", p.guard(p.handleKeyItem))
 	p.mux.HandleFunc("/panel/api/pool", p.guard(p.handlePool))
@@ -114,13 +115,19 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	capSnap := capacity.Compute(views, p.d.Log.Recent(400), pcfg.MaxInFlight, pcfg.KeyQPS, p.d.Uptime())
 	hits, misses := p.d.Pool.Sessions().Stats()
 
+	// 探活模型允许在线改，所以这里必须回填热配置里的值，而不是启动时的静态副本。
+	probeModel, probeMaxTokens := p.d.Live.Load().Probe()
+	probeCfg := p.d.Cfg.AutoProbe
+	probeCfg.Model = probeModel
+	probeCfg.MaxTokens = probeMaxTokens
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
 		"version":        p.d.Version,
 		"upstream":       p.d.Up.Base(),
 		"listen":         p.d.Cfg.Listen,
 		"data_dir":       p.d.Cfg.DataDir,
-		"auto_probe":     p.d.Cfg.AutoProbe,
+		"auto_probe":     probeCfg,
 		"logging":        p.d.Cfg.Logging,
 		"archive":        p.d.Log.ArchiveMeta(),
 		"uptime_seconds": int64(p.d.Uptime().Seconds()),
@@ -395,11 +402,18 @@ type probeResult struct {
 	Name    string `json:"name"`
 	OK      bool   `json:"ok"`
 	Latency int64  `json:"latency_ms"`
-	Error   string `json:"error,omitempty"`
+	// Model 是这次探活实际用的模型；空表示只打了 GET /v1/models。
+	Model string `json:"model,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
-// probeOne 打一次 /v1/models：只读，不消耗生成额度。
-// 成功只清 invalid（models 通了不代表 chat 通了），失败按类别落号状态。
+// probeOne 验一次号的可用性，并把结论落成状态。
+//
+// 打什么由「配置 → 探活 → 探活模型」决定：
+//   - 配了模型：真跑一次 max_tokens（默认 1）的生成，能验出 402 欠费 / 403 冻结；
+//   - 没配模型：只打 GET /v1/models。它是免费端点，**欠费号也返回 200**，
+//     所以只能证明密钥有效（清 invalid），不能复活停用号——这就是之前
+//     "余额不足的号点一下探活又变可用"的原因。
 func (p *Panel) probeOne(ctx context.Context, id, secret string) probeResult {
 	name := id
 	for _, v := range p.d.Pool.Views() {
@@ -408,22 +422,112 @@ func (p *Panel) probeOne(ctx context.Context, id, secret string) probeResult {
 			break
 		}
 	}
+	model, maxTokens := p.d.Live.Load().Probe()
+
 	start := time.Now()
-	c, cancel := context.WithTimeout(ctx, 20*time.Second)
+	c, cancel := context.WithTimeout(ctx, p.probeTimeout())
 	defer cancel()
-	_, err := p.d.Up.FetchModels(c, secret)
-	res := probeResult{ID: id, Name: name, OK: err == nil, Latency: time.Since(start).Milliseconds()}
+
+	var err error
+	if model == "" {
+		_, err = p.d.Up.FetchModels(c, secret)
+	} else {
+		_, err = p.d.Up.ProbeChat(c, secret, model, maxTokens)
+	}
+	res := probeResult{ID: id, Name: name, Model: model, OK: err == nil, Latency: time.Since(start).Milliseconds()}
 	if err == nil {
-		p.d.Pool.MarkOK(id)
+		if model == "" {
+			p.d.Pool.MarkAuthOK(id)
+		} else {
+			p.d.Pool.MarkOK(id)
+		}
 		return res
 	}
+
 	res.Error = err.Error()
 	var se *upstream.StatusError
-	if errors.As(err, &se) {
-		v := fault.Classify(se.Status, se.Body, nil)
-		p.d.Pool.MarkFail(id, pool.Outcome{Kind: v.Kind, Message: v.Message, RetryAfter: v.RetryAfter})
+	if !errors.As(err, &se) {
+		return res
 	}
+	v := fault.Classify(se.Status, se.Body, nil)
+	if v.Kind == fault.ModelDenied {
+		// 探活模型没在这个号上开通：是配置填错了，不是号坏了，别罚号。
+		res.Error = firstNonEmptyStr(v.Message, res.Error) + "（探活模型可能填错了，去「配置 → 探活」改）"
+		return res
+	}
+	p.d.Pool.MarkFail(id, pool.Outcome{
+		Kind: v.Kind, Model: model, Message: v.Message, RetryAfter: v.RetryAfter,
+	})
 	return res
+}
+
+// probeTimeout 是单号探活的超时预算：走 auto_probe.timeout，缺省 20s。
+func (p *Panel) probeTimeout() time.Duration {
+	if d := p.d.Cfg.AutoProbe.Timeout.Duration(); d > 0 {
+		return d
+	}
+	return 20 * time.Second
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// handleProbeConfig 读/改探活参数（目前是探活模型与 max_tokens）。
+// 改完立刻热生效：写进 livecfg 快照 + 回写 config.json 的 auto_probe 段。
+func (p *Panel) handleProbeConfig(w http.ResponseWriter, r *http.Request) {
+	curModel, curTokens := p.d.Live.Load().Probe()
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "model": curModel, "max_tokens": curTokens,
+			"enabled": p.d.Cfg.AutoProbe.Enabled,
+		})
+		return
+	}
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
+		return
+	}
+	// 以当前值打底再覆盖：只传 model 的请求不该把 max_tokens 重置。
+	in := struct {
+		Model     *string `json:"model"`
+		MaxTokens *int    `json:"max_tokens"`
+	}{}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	model, tokens := curModel, curTokens
+	if in.Model != nil {
+		model = strings.TrimSpace(*in.Model)
+	}
+	if in.MaxTokens != nil {
+		tokens = *in.MaxTokens
+	}
+	if tokens <= 0 {
+		tokens = 1
+	}
+	if tokens > 64 {
+		tokens = 64
+	}
+
+	snap := p.d.Live.Load()
+	snap.ProbeModel, snap.ProbeMaxTokens = model, tokens
+	p.d.Live.Store(snap)
+
+	// 写回配置文件，重启后仍是这个模型（改的是 probe 段，密钥永不落盘）。
+	pcfg := p.d.Cfg.AutoProbe
+	pcfg.Model, pcfg.MaxTokens = model, tokens
+	out := map[string]any{"ok": true, "model": model, "max_tokens": tokens}
+	if err := config.WriteAutoProbe(p.d.ConfigPath, pcfg); err != nil {
+		out["warning"] = "写回配置文件失败: " + err.Error()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {

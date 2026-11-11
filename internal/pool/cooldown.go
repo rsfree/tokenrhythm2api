@@ -134,6 +134,35 @@ func (p *Pool) MarkOK(id string) {
 	p.notify()
 }
 
+// MarkAuthOK 供"只证明密钥有效"的探活使用：GET /v1/models 通了只能说明 401 过去了。
+//
+// 刻意不碰 exhausted / blocked：欠费号拉模型列表同样是 200，用它把停用号放回来，
+// 等于把刚判死的号又派出去撞一次 402——面板上就会看到"余额不足却还是可用"。
+// 想复活这两类，必须用真跑一次生成的探活（MarkOK）或人工恢复。
+func (p *Pool) MarkAuthOK(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := p.keys[id]
+	if k == nil {
+		return
+	}
+	if k.State != StateInvalid {
+		return
+	}
+	if !k.Enabled {
+		return
+	}
+	k.State = StateActive
+	k.CooldownUntil = time.Time{}
+	k.CooldownReason = ""
+	k.FailStreak = 0
+	k.BreakerUntil = time.Time{}
+	k.LastError = ""
+	k.LastOKAt = time.Now()
+	p.refreshBatchLocked(time.Now())
+	p.notify()
+}
+
 // ClearModelBlock 在某模型请求成功后解除该 (号, 模型) 的封禁。
 func (p *Pool) ClearModelBlock(id, model string) {
 	if model == "" {

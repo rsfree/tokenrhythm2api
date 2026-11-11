@@ -8,6 +8,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -147,6 +148,34 @@ func (c *Client) FetchModels(ctx context.Context, secret string) ([]byte, error)
 		return nil, &StatusError{Status: res.Status, Body: res.Body}
 	}
 	return res.Body, nil
+}
+
+// ProbeChat 用最小代价跑一次真实生成：max_tokens 默认 1 的 chat 请求。
+//
+// 为什么不只打 /v1/models：那是免费端点，**欠费号拉模型列表也是 200**，
+// 拿它当探活会把刚因 402 停用的号又放回"可用"。只有真跑一次生成，
+// 才会把 402 欠费 / 403 冻结这些"账号级不可用"暴露出来。
+func (c *Client) ProbeChat(ctx context.Context, secret, model string, maxTokens int) (*Result, error) {
+	if maxTokens <= 0 {
+		maxTokens = 1
+	}
+	payload, err := json.Marshal(map[string]any{
+		"model":      model,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": maxTokens,
+		"stream":     false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.Do(ctx, http.MethodPost, "/v1/chat/completions", payload, secret, http.Header{}, false)
+	if err != nil {
+		return nil, err
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return res, &StatusError{Status: res.Status, Body: res.Body}
+	}
+	return res, nil
 }
 
 // StatusError 是上游返回非 2xx 时的结构化错误。

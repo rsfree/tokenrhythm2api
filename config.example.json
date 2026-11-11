@@ -94,7 +94,9 @@
     "enabled": true,
     "interval": "2m",
     "timeout": "15s",
-    "concurrency": 4
+    "concurrency": 4,
+    "model": "glm-5.3-flash",
+    "max_tokens": 1
   },
 
   "prices": {

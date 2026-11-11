@@ -600,14 +600,16 @@ function renderConfig() {
   const d = state.data;
   const p = d.pool || {};
   if (!$('poolForm').dataset.dirty) fillPoolForm(p);
+  if (!$('probeForm').dataset.dirty) fillProbeForm(d.auto_probe || {});
 
+  const probeModel = (d.auto_probe && d.auto_probe.model) || '';
   const rows = [
     ['版本', `<code>${esc(d.version || 'dev')}</code>`],
     ['监听', `<code>${esc(d.listen || '—')}</code>`],
     ['上游', `<code>${esc(d.upstream || '—')}</code>`],
     ['数据目录', `<code>${esc(d.data_dir || '—')}</code>`],
     ['运行时长', fmtDur(d.uptime_seconds || 0)],
-    ['自动探活', d.auto_probe ? `${d.auto_probe.enabled ? '开' : '关'} · 每 ${fmtDur(parseDur(d.auto_probe.interval))}` : '—'],
+    ['自动探活', d.auto_probe ? `${d.auto_probe.enabled ? '开' : '关'} · 每 ${fmtDur(parseDur(d.auto_probe.interval))} · ${probeModel ? '真跑生成 <code>' + esc(probeModel) + '</code>' : '<span class="warn">只拉 /v1/models（看不出欠费）</span>'}` : '—'],
     ['日志环', d.logging ? `${d.logging.ring_size} 条${d.logging.log_bodies ? ' · 记 body' : ''}` : '—'],
     ['价目表', `${(d.prices && d.prices.count) || 0} 个 · ${mmddhhmm(d.prices && d.prices.updated_at)}`],
     ['请求归档', d.archive && d.archive.enabled ? `开 · 保留 ${d.archive.retain_days} 天 / ${d.archive.max_mb}MB` : '关'],
@@ -656,6 +658,31 @@ function fillPoolForm(p) {
 $('poolForm').addEventListener('input', () => {
   $('poolForm').dataset.dirty = '1';
   state.formDirty = true;
+});
+
+function fillProbeForm(ap) {
+  $('probeModel').value = ap.model || '';
+  $('probeMaxTokens').value = ap.max_tokens || 1;
+}
+
+$('probeForm').addEventListener('input', () => {
+  $('probeForm').dataset.dirty = '1';
+});
+
+$('btnSaveProbe').addEventListener('click', async () => {
+  const model = $('probeModel').value.trim();
+  const maxTokens = Math.min(64, Math.max(1, parseInt($('probeMaxTokens').value, 10) || 1));
+  try {
+    const r = await api('/panel/api/probe', {
+      method: 'PUT',
+      body: JSON.stringify({ model, max_tokens: maxTokens }),
+    });
+    $('probeForm').dataset.dirty = '';
+    await refresh();
+    toast(`探活已改为 ${r.model ? '真跑生成 ' + r.model : '只拉 /v1/models'}${r.warning ? '（' + r.warning + '）' : ''}`, !!r.warning);
+  } catch (err) {
+    toast(err.message, true);
+  }
 });
 
 // ---------- 渲染：运行日志 ----------
