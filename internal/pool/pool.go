@@ -87,6 +87,19 @@ func (p *Pool) Config() config.PoolConfig {
 	return p.cfg
 }
 
+// Names 返回池内全部号名（按入池顺序），批量导入靠它避开重名。
+func (p *Pool) Names() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.order))
+	for _, id := range p.order {
+		if k := p.keys[id]; k != nil {
+			out = append(out, k.Name)
+		}
+	}
+	return out
+}
+
 // ---------- 增删改 ----------
 
 // validateSecret 校验密钥形态。单个/批量入池共用同一套判定，

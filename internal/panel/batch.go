@@ -58,9 +58,7 @@ func (p *Panel) handleKeysBatch(w http.ResponseWriter, r *http.Request) {
 	if req.Weight != nil && *req.Weight > 0 {
 		weight = *req.Weight
 	}
-	startTotal, _, _, _, _, _ := p.d.Pool.Counts()
-
-	items := parseKeyLines(req.Secrets, req.Prefix, startTotal, weight, budget)
+	items := parseKeyLines(req.Secrets, req.Prefix, p.d.Pool.Names(), weight, budget)
 	if len(items) == 0 {
 		writeErr(w, http.StatusBadRequest, "没有解析到任何密钥：每行一个 sk_tr_ 开头的密钥")
 		return
@@ -111,12 +109,17 @@ func (p *Panel) handleKeysBatch(w http.ResponseWriter, r *http.Request) {
 //	主账号 sk_tr_xxx              空格分隔
 //
 // 谁在左谁在右不靠猜：带 sk- / sk_ 前缀的那半永远被当密钥，另一半当名称。
-// 只给了密钥的行按「前缀 + 序号」自动命名，序号从池子里现有的条数接着数。
-func parseKeyLines(text, prefix string, startTotal int, weight, budget float64) []batchItem {
+// 只给了密钥的行按「前缀 + 序号」自动命名：序号从 1 开始，跳过池内已占用的名称
+// （导 20 个号就该看到 tr-1…tr-20，而不是接着池里条数从 tr-4 起）。
+func parseKeyLines(text, prefix string, existing []string, weight, budget float64) []batchItem {
 	if strings.TrimSpace(prefix) == "" {
 		prefix = "key-"
 	}
-	seq := startTotal + 1
+	taken := make(map[string]bool, len(existing))
+	for _, n := range existing {
+		taken[n] = true
+	}
+	seq := 1
 	var out []batchItem
 	for i, raw := range strings.Split(text, "\n") {
 		name, secret := splitKeyLine(raw)
@@ -125,8 +128,14 @@ func parseKeyLines(text, prefix string, startTotal int, weight, budget float64) 
 			continue
 		}
 		if name == "" {
-			name = fmt.Sprintf("%s%d", prefix, seq)
-			seq++
+			for {
+				name = fmt.Sprintf("%s%d", prefix, seq)
+				seq++
+				if !taken[name] {
+					break
+				}
+			}
+			taken[name] = true
 		}
 		out = append(out, batchItem{
 			Line:  i + 1,

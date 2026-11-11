@@ -43,7 +43,7 @@ func TestParseKeyLines(t *testing.T) {
 
 // 两个都不像密钥时整行当密钥，让后面的形态校验报错，别悄悄塞一个空密钥进池。
 func TestParseKeyLinesKeepsGarbage(t *testing.T) {
-	items := parseKeyLines("hello world\nabc=def", "key-", 2, 1, 0)
+	items := parseKeyLines("hello world\nabc=def", "key-", nil, 1, 0)
 	if len(items) != 2 {
 		t.Fatalf("解析出 %d 条, 想要 2", len(items))
 	}
@@ -55,15 +55,15 @@ func TestParseKeyLinesKeepsGarbage(t *testing.T) {
 	}
 }
 
-// 自动命名要接着池子里现有的序号排，不然导第二批又出现 key-1。
+// 自动命名从 1 开始，并跳过池内已占用的名字：导 20 个号就该是 tr-1…tr-20。
 func TestParseKeyLinesAutoName(t *testing.T) {
 	text := "sk_tr_a\nsk_tr_b\n# 注释\n\n有名字=sk_tr_c\nsk_tr_d"
-	items := parseKeyLines(text, "tr-", 7, 1, 2.5)
+	items := parseKeyLines(text, "tr-", []string{"账号A", "tr-1", "tr-3"}, 1, 2.5)
 	got := make([]string, len(items))
 	for i, it := range items {
 		got[i] = it.Draft.Name
 	}
-	want := []string{"tr-8", "tr-9", "有名字", "tr-10"}
+	want := []string{"tr-2", "tr-4", "有名字", "tr-5"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("名称 = %v, 想要 %v", got, want)
 	}
