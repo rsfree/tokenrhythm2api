@@ -448,6 +448,52 @@ func TestPassthroughMode(t *testing.T) {
 	}
 }
 
+func TestAllKeysDeadReturns503(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 2 })
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.WriteHeader(402)
+		_, _ = io.WriteString(w, `{"code":"INSUFFICIENT_BALANCE","message":"账户余额不足"}`)
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("号全欠费应回 503，而不是把上游 402 透传给客户端，实际 %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "NO_CAPACITY") || !strings.Contains(body, "号池无可用账号") {
+		t.Fatalf("错误体应说清是号池空了，实际 %s", body)
+	}
+	if !strings.Contains(body, "欠费 2") {
+		t.Fatalf("错误体应带上池子现状（欠费 2），实际 %s", body)
+	}
+	if got := resp.Header.Get("X-Trpool-Reason"); got != "keys-dead" {
+		t.Fatalf("应标 X-Trpool-Reason: keys-dead，实际 %q", got)
+	}
+	if c := h.fk.count(); c != 2 {
+		t.Fatalf("两个号各撞一次，实际 %d 次", c)
+	}
+	for _, v := range h.pool.Views() {
+		if v.State != "exhausted" || v.CooldownLeft != 0 {
+			t.Fatalf("402 后号应停用且无冷却，实际 %s 冷却 %ds", v.State, v.CooldownLeft)
+		}
+	}
+}
+
+// 池里还有活号、只是这一轮抽到的都是死号：仍然不能透传 402（那是上游号的账），
+// 但也不能谎报"号池无可用账号"——让客户端重试就行。
+func TestDeadRoundWithLiveKeysAsksRetry(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.WriteHeader(403)
+		_, _ = io.WriteString(w, `{"code":"ACCOUNT_SUSPENDED","message":"账号已冻结"}`)
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("应回 503，实际 %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "请重试") || strings.Contains(body, "号池无可用账号") {
+		t.Fatalf("池内仍有活号时应让客户端重试，实际 %s", body)
+	}
+}
+
 func TestLogsRecorded(t *testing.T) {
 	h := newHarness(t, nil)
 	h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)

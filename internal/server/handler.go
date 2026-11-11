@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -111,6 +112,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var lastTrace string
 	var lastErr string
 	var lastVerdict fault.Verdict
+	// 每次失败尝试的归类：用来判断"这一整轮是不是号都欠费/冻结了"。
+	var failedKinds []fault.Kind
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		lease, err := s.d.Pool.Acquire(pool.PickRequest{
@@ -154,6 +157,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			lastStatus = http.StatusBadGateway
 			lastBody = errJSON("UPSTREAM_ERROR", err.Error())
 			lastErr = err.Error()
+			failedKinds = append(failedKinds, fault.Upstream)
 			s.noteFailure(r, reqID, lease, model, path, lastStatus, attempt, start, "", err.Error())
 			if attempt < maxAttempts && !sleepCtx(r.Context(), backoffFor(attempt-1)) {
 				return
@@ -169,6 +173,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				Kind: v.Kind, Model: model, Message: v.Message, RetryAfter: v.RetryAfter,
 			})
 			lastStatus, lastBody, lastTrace, lastErr, lastVerdict = res.Status, res.Body, res.TraceID, v.Message, v
+			failedKinds = append(failedKinds, v.Kind)
 			s.noteFailure(r, reqID, lease, model, path, res.Status, attempt, start, res.TraceID, v.Message)
 
 			if !v.Retryable {
@@ -206,12 +211,35 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if lastBody == nil {
 		lastBody = errJSON("UPSTREAM_ERROR", lastErr)
 	}
+
+	// 整轮都栽在"号欠费 / 号被冻结"上：这是号池的账，不是客户端的账。
+	//
+	// 原样透传上游的 402/403 会让调用方以为自己欠费、或被永久拒绝，去查自己的账号，
+	// 而真正要做的是给号充值 / 等解封——还得有人在面板上数一遍才知道是哪个号。
+	// 所以这里改写成网关自己的 503，并把池子现状写进 message。
+	errSource := "upstream"
+	if onlyDeadKeys(failedKinds) {
+		total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
+		msg := fmt.Sprintf("号池无可用账号：本次 %d 个号全部欠费或冻结（池内共 %d 个：欠费 %d、冻结 %d、失效 %d、冷却 %d、禁用 %d）",
+			len(failedKinds), total, exhausted, blocked, invalid, cooling, disabled)
+		if healthy > 0 {
+			// 池里还有活号，只是这一轮抽到的全是死号：让客户端重试即可，别谎报"没有账号"。
+			msg = fmt.Sprintf("本轮 %d 个号都已欠费或冻结，池内仍有 %d 个可用号，请重试",
+				len(failedKinds), healthy)
+		}
+		lastStatus = http.StatusServiceUnavailable
+		lastBody = errJSON("NO_CAPACITY", msg)
+		lastErr = msg
+		errSource = "pool" // 别让监控按 upstream 归因到上游故障
+		w.Header().Set("X-Trpool-Reason", "keys-dead")
+	}
+
 	if lastVerdict.Kind == fault.ModelDenied {
 		// 把"是这个模型在全部号上都没开通"标出来：客户端换模型才有救，
 		// 否则只会看到一句上游原文，误以为是网关没号。
 		w.Header().Set("X-Trpool-Reason", "model-denied")
 	}
-	w.Header().Set("X-Trpool-Error", "upstream")
+	w.Header().Set("X-Trpool-Error", errSource)
 	if lastTrace != "" {
 		w.Header().Set("X-Trpool-Trace", lastTrace)
 	}
@@ -369,6 +397,22 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 }
 
 // ---------- 辅助 ----------
+
+// onlyDeadKeys 判断这一轮失败是否全部来自"号欠费(quota) / 号被冻结(banned)"。
+//
+// 只认这两种：掺进一条 5xx、网络错误或 429，就说明池子不是"全死了"，
+// 那种情况保留上游原文更有排障价值。
+func onlyDeadKeys(kinds []fault.Kind) bool {
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, k := range kinds {
+		if k != fault.Quota && k != fault.Banned {
+			return false
+		}
+	}
+	return true
+}
 
 func copySuccessHeaders(w http.ResponseWriter, src http.Header, stream bool) {
 	for k, vs := range src {

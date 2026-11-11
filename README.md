@@ -145,7 +145,9 @@ print(client.chat.completions.create(
 | `X-Trpool-Attempt` | 第几次尝试（1 = 一次成功） |
 | `X-Trpool-Trace` | 上游 trace_id，对工单用 |
 | `X-Trpool-Reason: model-denied` | 模型级封禁，换号也无解 |
+| `X-Trpool-Reason: keys-dead` | 这一轮撞到的号全部欠费/冻结，已改写成 503 |
 | `X-Trpool-Error: upstream` | 换满 `retry_max` 仍未成功 |
+| `X-Trpool-Error: pool` | 失败根因在号池（欠费/冻结），不是上游炸了 |
 
 ---
 
@@ -385,6 +387,20 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 
 **选不到号也会留一条记录**（`503 NO_CAPACITY`，号名为空）：池空了、全部冷却、全部 401 失效，
 是最需要人介入的故障，不该在面板上完全静默。
+
+### 号全欠费/冻结时不透传 402
+
+一轮里被撞到的号**全部**是 402（欠费）/ 403（冻结）时，网关不会把上游那句
+`INSUFFICIENT_BALANCE` 原样丢给客户端——那是**号池的账**，不是调用方的账，
+透传只会让人去查自己的账号。改成网关自己的 503：
+
+| 池内还有活号 | 返回 |
+|---|---|
+| 否 | `503 NO_CAPACITY`「号池无可用账号：本次 N 个号全部欠费或冻结（池内共 M 个：欠费 a、冻结 b、失效 c、冷却 d、禁用 e）」 |
+| 是（只是这一轮抽到死号） | `503 NO_CAPACITY`「本轮 N 个号都已欠费或冻结，池内仍有 M 个可用号，请重试」 |
+
+两种都带 `X-Trpool-Reason: keys-dead`。**5xx / 网络错误 / 429 掺进来一条就不改写**——
+那种情况保留上游原文排障更有用。
 
 日志页右上角「历史归档」按钮切成归档模式（服务端过滤，因为归档可能有几十万行）。
 
