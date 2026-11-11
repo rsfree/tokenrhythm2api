@@ -113,6 +113,29 @@ func TestArchiveDisabled(t *testing.T) {
 	}
 }
 
+// Note 是"成功了但有话要说"：客户端 Ctrl-C、usage 估算。它不能被算成失败，
+// 否则面板的"仅失败/最近异常"会被用户主动取消刷满。
+func TestNoteIsNotFailure(t *testing.T) {
+	r := New(Config{RingSize: 5, Archive: true, ArchiveDir: t.TempDir(), RetainDays: 7, MaxMB: 10})
+	defer r.Close()
+	r.Record(Entry{Status: 200, Model: "m", Note: "客户端断开: context canceled"})
+
+	ok, err := r.Query(Filter{Status: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ok) != 1 || ok[0].Note == "" {
+		t.Fatalf("带 Note 的成功记录应落在 ok 组: %+v", ok)
+	}
+	bad, _ := r.Query(Filter{Status: "bad"})
+	if len(bad) != 0 {
+		t.Fatalf("Note 不该被算成失败: %+v", bad)
+	}
+	if hit, _ := r.Query(Filter{Text: "context"}); len(hit) != 1 {
+		t.Fatal("文本搜索应覆盖 Note")
+	}
+}
+
 func TestRequestID(t *testing.T) {
 	a, b := NewRequestID(), NewRequestID()
 	if len(a) != 32 || a == b {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,21 @@ import (
 	"trpool/internal/upstream"
 	"trpool/internal/usage"
 )
+
+// TestPanelJSSyntax 用 node --check 做一次前端语法闸门。
+//
+// 前端是 go:embed 进来的，Go 编译完全看不见它：一个重复声明的变量能让整个面板白屏，
+// 而后端测试全绿。这类问题只会在浏览器里暴露，所以在这里补一道最便宜的检查。
+func TestPanelJSSyntax(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("未安装 node，跳过 JS 语法检查")
+	}
+	out, err := exec.Command(node, "--check", "web/app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("web/app.js 语法错误: %v\n%s", err, out)
+	}
+}
 
 type pHarness struct {
 	p       *Panel

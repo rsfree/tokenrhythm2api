@@ -333,6 +333,23 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 
 `/panel`（Bearer `admin_key`，也支持 `?token=<admin_key>` 浏览器直开）。左侧导航七页，窄屏收成抽屉。
 
+| 总览 | 账号池 |
+|---|---|
+| ![总览](docs/screenshots/overview.png) | ![账号池](docs/screenshots/accounts.png) |
+
+| 用量 | 容量规划 |
+|---|---|
+| ![用量](docs/screenshots/usage.png) | ![容量规划](docs/screenshots/capacity.png) |
+
+| 模型与档位 | 配置 |
+|---|---|
+| ![模型与档位](docs/screenshots/models.png) | ![配置](docs/screenshots/config.png) |
+
+![运行日志](docs/screenshots/logs.png)
+
+> 截图数据来自本地假上游（`docs/screenshots` 里的密钥与号名均为演示用），
+> 刻意造了 429 冷却、403 模型未开通、换号重试三类现场。
+
 | 页 | 解决什么 |
 |---|---|
 | **总览** | 可用号/请求/消耗/今日四张卡；调度快照（batch 用量与目标、会话命中、在途、粘性任务）；**最近异常**——失败请求按时间倒序，带状态码、号名、模型与上游原话 |

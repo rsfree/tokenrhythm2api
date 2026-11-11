@@ -315,7 +315,9 @@ function renderBatchKv(d) {
   const p = d.pool || {};
   const rows = [
     ['batch 模式', b.mode || (p.batch && p.batch.mode) || 'off'],
-    ['batch 用量', `${b.size ?? 0} 个号 / 目标 ${b.target ?? 0}`],
+    ['batch 用量', b.mode === 'off'
+      ? `全池参与（${(d.keys || []).length} 个号）`
+      : `${b.size ?? 0} 个号 / 目标 ${b.target ?? 0}`],
     ['活跃会话', String(b.sessions ?? 0)],
     ['在途请求', String(b.total_inflight ?? 0)],
     ['粘性任务', String(b.sticky_tasks ?? 0)],
@@ -519,13 +521,26 @@ function renderCapacity() {
 
 // ---------- 渲染：模型与档位 ----------
 
+// 封禁明细按「号 × 模型」展开，而不是只报一句"某模型有 N 个号被封"：
+// 要知道是哪把钥匙、还剩多久、能不能现在就解除。
+function modelBlockRows(d) {
+  const rows = [];
+  (d.keys || []).forEach((k) => (k.model_blocks || []).forEach((b) => {
+    const left = Math.max(0, Math.round((new Date(b.until).getTime() - Date.now()) / 1000));
+    rows.push({ id: k.id, key: k.name, model: b.model, kind: b.kind, left, reason: b.reason || '' });
+  }));
+  rows.sort((a, b) => a.model.localeCompare(b.model) || b.left - a.left);
+  return rows;
+}
+
 function renderModels() {
   const d = state.data;
-  const mh = d.model_health || [];
-  $('modelHealth').innerHTML = mh.length ? mh.map((h) => `
+  const blocks = modelBlockRows(d);
+  $('modelHealth').innerHTML = blocks.length ? blocks.map((r) => `
     <div class="feed-row">
-      <span class="name"><code>${esc(h.model)}</code></span>
-      <span class="val">${h.keys} 个号 · ${h.kind === 'denied' ? '未开通' : '限流'} · ${h.earliest_left ? fmtDur(h.earliest_left) + ' 后恢复' : '—'}</span>
+      <span class="name"><code>${esc(r.model)}</code> <span class="muted">· ${esc(r.key)}</span></span>
+      <span class="val" title="${esc(r.reason)}">${r.kind === 'denied' ? '未开通' : '限流'} · ${r.left ? fmtDur(r.left) + ' 后恢复' : '即将到期'}
+        <button class="icon-btn" data-unblock="${esc(r.id)}" data-model="${esc(r.model)}">解除</button></span>
     </div>`).join('') : '<div class="empty">当前没有模型级封禁（MODEL_ACCESS_DENIED 只封号 × 模型，不罚整个号）。</div>';
   const list = (d.prices && d.prices.list) || [];
   const q = ($('modelSearch').value || '').trim().toLowerCase();
@@ -639,7 +654,7 @@ function logMatches(l) {
   if (f.model !== 'all' && l.model !== f.model) return false;
   if (f.text) {
     const t = f.text.toLowerCase();
-    const hay = `${l.trace_id || ''} ${l.error || ''} ${l.model || ''} ${l.key_name || ''}`.toLowerCase();
+    const hay = `${l.trace_id || ''} ${l.error || ''} ${l.note || ''} ${l.model || ''} ${l.key_name || ''}`.toLowerCase();
     if (!hay.includes(t)) return false;
   }
   return true;
@@ -679,7 +694,7 @@ function renderLogsTable() {
   } else {
     tb.innerHTML = rows.map((l) => {
       const ok = l.status > 0 && l.status < 400;
-      const note = l.error ? l.error : (l.attempt > 1 ? `第 ${l.attempt} 次尝试成功` : '');
+      const note = l.error || l.note || (l.attempt > 1 ? `第 ${l.attempt} 次尝试成功` : '');
       return `<tr>
         <td class="muted mono" title="${esc(l.request_id || '')}">${mmddhhmm(l.time)}</td>
         <td>${esc(l.key_name || '—')}</td>
@@ -806,6 +821,19 @@ $('keyTable').addEventListener('click', async (e) => {
   } finally {
     btn.disabled = false;
     if (act === 'probe') btn.textContent = '探活';
+  }
+});
+
+$('modelHealth').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-unblock]');
+  if (!btn) return;
+  try {
+    await api(`/panel/api/keys/${btn.dataset.unblock}/models?model=${encodeURIComponent(btn.dataset.model)}`,
+      { method: 'DELETE' });
+    toast('已解除封禁');
+    await refresh();
+  } catch (err) {
+    toast(err.message, true);
   }
 });
 

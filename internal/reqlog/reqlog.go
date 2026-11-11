@@ -42,7 +42,12 @@ type Entry struct {
 	Attempt  int    `json:"attempt"`
 	Fallback bool   `json:"fallback,omitempty"`
 	TraceID  string `json:"trace_id,omitempty"`
-	Error    string `json:"error,omitempty"`
+	// Error 是"这次请求失败了"。
+	Error string `json:"error,omitempty"`
+	// Note 是"成功了但有话要说"（客户端中途断开、usage 是估算的）。
+	// 和 Error 分开是因为面板的"仅失败/最近异常"按 Error 判定：
+	// 用户按了 Ctrl-C 不该被算成一次故障，否则异常面板永远被噪声刷满。
+	Note string `json:"note,omitempty"`
 
 	ClientIP string `json:"client_ip,omitempty"`
 	UA       string `json:"ua,omitempty"`
@@ -85,7 +90,7 @@ func (f Filter) match(e Entry) bool {
 	}
 	if f.Text != "" {
 		t := strings.ToLower(f.Text)
-		hay := strings.ToLower(e.RequestID + " " + e.TraceID + " " + e.Error + " " + e.Model + " " + e.KeyName + " " + e.Path)
+		hay := strings.ToLower(e.RequestID + " " + e.TraceID + " " + e.Error + " " + e.Note + " " + e.Model + " " + e.KeyName + " " + e.Path)
 		if !strings.Contains(hay, t) {
 			return false
 		}

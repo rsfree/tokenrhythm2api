@@ -36,6 +36,8 @@ func (s *Server) logLine(e reqlog.Entry) {
 	note := ""
 	if e.Error != "" {
 		note = " err=" + truncate(e.Error, 120)
+	} else if e.Note != "" {
+		note = " note=" + truncate(e.Note, 120)
 	}
 	fallback := ""
 	if e.Fallback {

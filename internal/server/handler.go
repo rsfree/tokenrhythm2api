@@ -262,7 +262,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 		cost := s.d.Prices.Cost(model, u)
 		entry.Cost = cost
 		if werr != nil {
-			entry.Error = "客户端断开: " + werr.Error()
+			entry.Note = "客户端断开: " + werr.Error()
 		}
 		s.d.Pool.Record(lease.KeyID, u.Prompt, u.Completion, cost)
 		s.d.Pool.Release(lease, pool.Outcome{Model: model})
@@ -294,7 +294,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 	entry.PromptTokens, entry.CompletionTokens = u.Prompt, u.Completion
 	entry.Cost = cost
 	if u.Estimated {
-		entry.Error = "usage 为估算值"
+		entry.Note = "usage 为估算值"
 	}
 
 	copySuccessHeaders(w, res.Header, false)
