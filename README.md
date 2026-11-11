@@ -412,6 +412,8 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 
 ### 批量加号
 
+![批量加号](docs/screenshots/batch.png)
+
 账号池 → 右上角「+ 添加号」→ 切到「批量」，把密钥整列粘进去：
 
 ```
