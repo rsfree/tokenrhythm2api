@@ -17,13 +17,17 @@ import (
 type State string
 
 const (
-	StateActive    State = "active"
-	StateCooling   State = "cooling"
-	StateInvalid   State = "invalid"   // 401，需人工/探活重置
-	StateExhausted State = "exhausted" // 402 余额不足，退避后自动重试
+	StateActive  State = "active"
+	StateCooling State = "cooling"
+	StateInvalid State = "invalid" // 401，需人工/探活重置
+	// StateExhausted 是 402 INSUFFICIENT_BALANCE：余额不足。
+	// 命中即停用，没有冷却也不会自己回来——充值后由人工恢复
+	// （补额度 / 「恢复」 / 「探活」）。
+	StateExhausted State = "exhausted"
 	// StateBlocked 是 403 ACCOUNT_SUSPENDED：账号被平台冻结/封禁。
-	// 和 exhausted 分开是因为处置不同——欠费充钱就活，冻结只能等上游解封，
-	// 而且它绝不能被算成"429 压力"去触发弹性扩容（多开号救不了封号）。
+	// 同样是停用终态，只能等上游解封后人工恢复。
+	// 和 exhausted 分开是因为处置不同（充钱 vs 等解封），而且它绝不能被算成
+	// "429 压力"去触发弹性扩容——多开号救不了封号。
 	StateBlocked  State = "blocked"
 	StateDisabled State = "disabled" // 人工摘号
 )

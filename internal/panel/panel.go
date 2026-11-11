@@ -56,6 +56,7 @@ func New(d Deps) *Panel {
 	// 比 "/panel/api/keys/" 这个子树更具体，ServeMux 会优先匹配到它
 	p.mux.HandleFunc("/panel/api/keys/batch", p.guard(p.handleKeysBatch))
 	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
+	p.mux.HandleFunc("/panel/api/keys/revive", p.guard(p.handleReviveStopped))
 	p.mux.HandleFunc("/panel/api/keys/", p.guard(p.handleKeyItem))
 	p.mux.HandleFunc("/panel/api/pool", p.guard(p.handlePool))
 	p.mux.HandleFunc("/panel/api/prices", p.guard(p.handlePrices))
@@ -432,6 +433,11 @@ func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]probeResult, 0)
 	for _, k := range p.d.Pool.Views() {
+		// 人工停用的号不探：那是"我故意摘掉的"，探通了也不该放回来。
+		// 欠费/冻结（enabled 仍为 true）照探——这是它们的唯一恢复通道。
+		if !k.Enabled {
+			continue
+		}
 		secret, ok := p.d.Pool.SecretOf(k.ID)
 		if !ok {
 			continue
@@ -440,6 +446,20 @@ func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.persist()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out})
+}
+
+// handleReviveStopped 批量恢复因欠费/冻结停用的号。
+// 典型用法：给 20 个号充完值，点一次「恢复停用号」，不用一个个点「重置」。
+func (p *Panel) handleReviveStopped(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
+		return
+	}
+	names := p.d.Pool.ReviveStopped()
+	if len(names) > 0 {
+		p.persist()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revived": len(names), "names": names})
 }
 
 // ---------- 调度参数 ----------

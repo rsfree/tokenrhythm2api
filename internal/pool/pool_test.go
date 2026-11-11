@@ -267,7 +267,7 @@ func TestBreakerThreshold(t *testing.T) {
 }
 
 func TestAuthAndQuotaStates(t *testing.T) {
-	p := testPool(t, func(c *config.PoolConfig) { c.ExhaustedCooldown = config.Duration(time.Minute) })
+	p := testPool(t, nil)
 	a := addKey(t, p, "a", 0)
 	b := addKey(t, p, "b", 0)
 
@@ -364,7 +364,7 @@ func TestDoubleReleaseDoesNotLeak(t *testing.T) {
 }
 
 func TestStickyTaskReturnsCoolingKey(t *testing.T) {
-	p := testPool(t, func(c *config.PoolConfig) { c.ExhaustedCooldown = config.Duration(time.Minute) })
+	p := testPool(t, nil)
 	a := addKey(t, p, "a", 0)
 	addKey(t, p, "b", 0)
 	a.State = StateExhausted

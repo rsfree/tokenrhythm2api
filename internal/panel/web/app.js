@@ -224,7 +224,7 @@ $('navToggle').addEventListener('click', () => $('nav').classList.toggle('open')
 
 const STATE_TEXT = {
   active: '可用', cooling: '冷却中', invalid: '密钥失效',
-  exhausted: '余额耗尽', blocked: '账号已冻结', disabled: '已停用',
+  exhausted: '余额耗尽 · 停用', blocked: '账号已冻结 · 停用', disabled: '已停用',
 };
 
 function stateBadge(k) {
@@ -634,8 +634,6 @@ function fillPoolForm(p) {
   $('pFloor').value = p.credit_floor ?? 0;
   $('pIdle').value = p.idle_weight_per_hour ?? 0;
   $('pRate').value = Math.round(parseDur(p.rate_cooldown));
-  $('pExhaust').value = Math.max(1, Math.round(parseDur(p.exhausted_cooldown) / 60) || 30);
-  $('pBan').value = Math.max(1, Math.round(parseDur(p.banned_cooldown) / 60) || 30);
   $('pBreaker').value = Math.round(parseDur(p.breaker_cooldown));
   $('pInflight').value = p.inflight_penalty ?? 3;
   const ss = p.session_sticky || {};
@@ -963,8 +961,6 @@ $('btnSavePool').addEventListener('click', async () => {
     credit_floor: parseFloat($('pFloor').value) || 0,
     idle_weight_per_hour: parseFloat($('pIdle').value) || 0,
     rate_cooldown: Math.round(parseFloat($('pRate').value) || 20) + 's',
-    exhausted_cooldown: Math.max(1, parseInt($('pExhaust').value, 10) || 30) + 'm',
-    banned_cooldown: Math.max(1, parseInt($('pBan').value, 10) || 30) + 'm',
     breaker_cooldown: Math.round(parseFloat($('pBreaker').value) || 30) + 's',
     inflight_penalty: parseFloat($('pInflight').value) || 3,
     session_sticky: {
@@ -1011,6 +1007,21 @@ $('btnPrices').addEventListener('click', async () => {
 });
 
 $('modelSearch').addEventListener('input', () => renderModels());
+
+$('btnRevive').addEventListener('click', async () => {
+  const btn = $('btnRevive');
+  btn.disabled = true;
+  try {
+    const r = await api('/panel/api/keys/revive', { method: 'POST' });
+    await refresh();
+    if (!r.revived) { toast('没有因欠费/冻结停用的号'); return; }
+    toast(`已恢复 ${r.revived} 个号，记得确认额度够用`, false);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 $('btnProbe').addEventListener('click', async () => {
   const btn = $('btnProbe');

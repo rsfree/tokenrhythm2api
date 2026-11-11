@@ -155,7 +155,7 @@ func TestPanelPoolHotUpdateWritesConfig(t *testing.T) {
 	h := newPanelHarness(t)
 	body := `{"strategy":"round_robin","top_k":7,"max_in_flight":4,"retry_max":2,
 	 "rate_cooldown":"15s","rate_cooldown_max":"5m","breaker_cooldown":"20s",
-	 "exhausted_cooldown":"40m","upstream_timeout":"120s","video_timeout":"300s",
+	 "upstream_timeout":"120s","video_timeout":"300s",
 	 "sticky_ttl":"24h","key_qps":2,
 	 "session_sticky":{"enabled":true,"ttl":"20m","max_entries":500,"prefix_affinity":true},
 	 "batch":{"mode":"auto","size":3,"min":1,"max":0,"target_inflight_per_key":3}}`

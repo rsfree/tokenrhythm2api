@@ -3,19 +3,22 @@ package pool
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"trpool/internal/config"
 	"trpool/internal/fault"
 )
 
-// 402 余额不足：立刻退出窗口，按次数指数退避，而不是每 30 分钟拉回来撞一次。
-func TestQuotaMarksExhaustedAndEscalates(t *testing.T) {
+// 402 余额不足 = 账号不可用：命中即停用，没有冷却，Tick 也不会把它放回来。
+//
+// 这是刻意的："过一会儿自动重试"在 100 个号 99 个没充值时，只会变成
+// 每轮一轮的无效请求，还白占活跃窗口名额。
+func TestQuotaStopsKeyForGood(t *testing.T) {
 	p := testPool(t, nil)
 	k := addKey(t, p, "a", 0)
 
 	p.Release(acquire(t, p, PickRequest{Model: "m"}),
 		Outcome{Kind: fault.Quota, Message: "402 INSUFFICIENT_BALANCE 账户余额不足"})
+
 	got := p.keys[k.ID]
 	if got.State != StateExhausted {
 		t.Fatalf("状态 = %s, 想要 exhausted", got.State)
@@ -23,25 +26,49 @@ func TestQuotaMarksExhaustedAndEscalates(t *testing.T) {
 	if got.QuotaHits != 1 {
 		t.Fatalf("欠费计数 = %d, 想要 1", got.QuotaHits)
 	}
-	if d := time.Until(got.CooldownUntil); d < 25*time.Minute || d > 31*time.Minute {
-		t.Fatalf("首次冷却 = %s, 应约等于 exhausted_cooldown(30m)", d)
+	if !got.CooldownUntil.IsZero() {
+		t.Fatalf("不该再有冷却（%s）：停用是终态，恢复必须靠人工", got.CooldownUntil)
+	}
+	if !strings.Contains(got.CooldownReason, "停用") {
+		t.Fatalf("原因里应说明已停用，实际 %q", got.CooldownReason)
+	}
+
+	// 无论过多久、Tick 多少次，都不能自己回来
+	for i := 0; i < 5; i++ {
+		p.Tick()
+	}
+	if st := p.keys[k.ID].State; st != StateExhausted {
+		t.Fatalf("Tick 之后状态 = %s, 停用的号不能自动复活", st)
 	}
 	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
 		t.Fatal("余额不足的号不应再被派单")
+	} else if !strings.Contains(err.Error(), "余额耗尽") {
+		t.Fatalf("错误应说明是余额耗尽: %v", err)
 	}
+}
 
-	// 到期复活后再次欠费：次数要累加，冷却跟着翻倍（直接改到期时刻，不靠 sleep）
-	expireNow(t, p, k.ID)
-	if p.keys[k.ID].State != StateActive {
-		t.Fatalf("冷却到期应回到 active，实际 %s", p.keys[k.ID].State)
-	}
+// 403 ACCOUNT_SUSPENDED 同样是停用终态：只有人工解封后才该回来。
+func TestBannedStopsKeyForGood(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 0)
 	p.Release(acquire(t, p, PickRequest{Model: "m"}),
-		Outcome{Kind: fault.Quota, Message: "402 INSUFFICIENT_BALANCE"})
-	if hits := p.keys[k.ID].QuotaHits; hits != 2 {
-		t.Fatalf("欠费计数 = %d, 想要 2", hits)
+		Outcome{Kind: fault.Banned, Message: "403 ACCOUNT_SUSPENDED 账号已临时冻结"})
+
+	got := p.keys[k.ID]
+	if got.State != StateBlocked {
+		t.Fatalf("状态 = %s, 想要 blocked", got.State)
 	}
-	if d := time.Until(p.keys[k.ID].CooldownUntil); d < 55*time.Minute || d > 61*time.Minute {
-		t.Fatalf("第二次欠费冷却 = %s, 应翻倍到 1h", d)
+	if !got.CooldownUntil.IsZero() {
+		t.Fatalf("冻结不该有冷却，实际 %s", got.CooldownUntil)
+	}
+	if !strings.Contains(got.CooldownReason, "停用") {
+		t.Fatalf("原因里应说明已停用，实际 %q", got.CooldownReason)
+	}
+	for i := 0; i < 5; i++ {
+		p.Tick()
+	}
+	if st := p.keys[k.ID].State; st != StateBlocked {
+		t.Fatalf("Tick 之后状态 = %s, 冻结号不能自动复活", st)
 	}
 }
 
@@ -59,15 +86,8 @@ func TestBannedIsNotRatePressure(t *testing.T) {
 	p.Release(acquire(t, p, PickRequest{Model: "m"}),
 		Outcome{Kind: fault.Banned, Message: "403 ACCOUNT_SUSPENDED 账号已临时冻结"})
 
-	got := p.keys[k.ID]
-	if got.State != StateBlocked {
-		t.Fatalf("状态 = %s, 想要 blocked（不能和普通冷却混为一谈）", got.State)
-	}
-	if got.BanHits != 1 {
+	if got := p.keys[k.ID]; got.BanHits != 1 {
 		t.Fatalf("冻结计数 = %d, 想要 1", got.BanHits)
-	}
-	if !strings.Contains(got.CooldownReason, "冻结") {
-		t.Fatalf("冷却原因丢了原文: %q", got.CooldownReason)
 	}
 	st := p.BatchState()
 	if st.RateHits != 0 {
@@ -85,19 +105,7 @@ func TestBannedIsNotRatePressure(t *testing.T) {
 	}
 }
 
-// 冻结号的冷却必须比 429 长一个量级：秒级重试对封号毫无意义。
-func TestBannedCooldownBeatsRateCooldown(t *testing.T) {
-	p := testPool(t, nil)
-	k := addKey(t, p, "a", 0)
-	p.Release(acquire(t, p, PickRequest{Model: "m"}),
-		Outcome{Kind: fault.Banned, Message: "ACCOUNT_SUSPENDED"})
-	d := time.Until(p.keys[k.ID].CooldownUntil)
-	if d < 10*time.Minute {
-		t.Fatalf("冻结冷却 = %s, 默认档位应远长于 429 的 %s", d, p.cfg.RateCooldown.Duration())
-	}
-}
-
-// 全池不可用时的兜底探活会拿真实请求去试；冻结号已经确定不可用，不能被挑中。
+// 全池不可用时的兜底探活会拿真实请求去试；停用号已经确定不可用，不能被挑中。
 func TestFallbackProbeSkipsBlocked(t *testing.T) {
 	p := testPool(t, func(c *config.PoolConfig) {
 		c.FallbackProbe = true
@@ -116,75 +124,121 @@ func TestFallbackProbeSkipsBlocked(t *testing.T) {
 	}
 }
 
-func TestTickRevivesBlocked(t *testing.T) {
-	p := testPool(t, nil)
-	k := addKey(t, p, "a", 0)
-	p.Release(acquire(t, p, PickRequest{Model: "m"}),
-		Outcome{Kind: fault.Banned, Message: "ACCOUNT_SUSPENDED"})
-	expireNow(t, p, k.ID)
-	if st := p.keys[k.ID].State; st != StateActive {
-		t.Fatalf("冷冻到期应自动重试，状态 = %s", st)
-	}
-}
-
-// expireNow 把冷却拨到过去并跑一次 Tick，避免测试里 sleep 造成的抖动。
-func expireNow(t *testing.T, p *Pool, id string) {
-	t.Helper()
-	p.mu.Lock()
-	if k := p.keys[id]; k != nil {
-		k.CooldownUntil = time.Now().Add(-time.Millisecond)
-	}
-	p.mu.Unlock()
-	p.Tick()
-}
-
-// 探活不是业务流量：连点"探活"不能把冻结号的冷却越探越久。
-func TestProbeDoesNotEscalate(t *testing.T) {
+// 探活失败不该让停用号变得更难恢复，也不该累加计数（停用后没有退避这回事）。
+func TestProbeFailDoesNotEscalate(t *testing.T) {
 	p := testPool(t, nil)
 	k := addKey(t, p, "a", 0)
 	o := Outcome{Kind: fault.Banned, Message: "ACCOUNT_SUSPENDED"}
 	p.MarkFail(k.ID, o)
-	first := time.Until(p.keys[k.ID].CooldownUntil)
 	p.MarkFail(k.ID, o)
-	if hits := p.keys[k.ID].BanHits; hits != 0 {
-		t.Fatalf("探活不该累加退避次数，实际 %d", hits)
+	got := p.keys[k.ID]
+	if got.BanHits != 0 {
+		t.Fatalf("探活不该累加计数，实际 %d", got.BanHits)
 	}
-	if d := time.Until(p.keys[k.ID].CooldownUntil); d > first+time.Second {
-		t.Fatalf("第二次探活把冷却从 %s 拉长到 %s", first, d)
+	if got.State != StateBlocked || !got.CooldownUntil.IsZero() {
+		t.Fatalf("探活失败后应保持停用且无冷却: state=%s until=%s", got.State, got.CooldownUntil)
 	}
 }
 
-// 人工重置要能把冻结号放出来，并且清空退避计数（否则下次一欠费就长时间静默）。
-func TestResetClearsTerminalCounters(t *testing.T) {
+// 人工探活成功是停用号的恢复通道之一（充完值/解封后先探一下）。
+func TestProbeOKRevivesStopped(t *testing.T) {
 	p := testPool(t, nil)
 	k := addKey(t, p, "a", 0)
 	p.Release(acquire(t, p, PickRequest{Model: "m"}),
 		Outcome{Kind: fault.Banned, Message: "ACCOUNT_SUSPENDED"})
-	if !p.Reset(k.ID) {
-		t.Fatal("reset 应成功")
-	}
+
+	p.MarkOK(k.ID)
 	got := p.keys[k.ID]
-	if got.State != StateActive || got.BanHits != 0 || !got.CooldownUntil.IsZero() {
-		t.Fatalf("重置后仍有残留: state=%s hits=%d until=%s", got.State, got.BanHits, got.CooldownUntil)
+	if got.State != StateActive || got.BanHits != 0 || got.LastError != "" {
+		t.Fatalf("探活成功应把号放回来: state=%s hits=%d err=%q", got.State, got.BanHits, got.LastError)
+	}
+	if _, err := p.Acquire(PickRequest{Model: "m"}); err != nil {
+		t.Fatalf("恢复后应能派单: %v", err)
 	}
 }
 
-func TestBackoffDur(t *testing.T) {
-	cases := []struct {
-		base, max time.Duration
-		hits      int
-		want      time.Duration
-	}{
-		{30 * time.Minute, 6 * time.Hour, 0, 30 * time.Minute},
-		{30 * time.Minute, 6 * time.Hour, 1, 30 * time.Minute},
-		{30 * time.Minute, 6 * time.Hour, 2, time.Hour},
-		{30 * time.Minute, 6 * time.Hour, 4, 4 * time.Hour},
-		{30 * time.Minute, 6 * time.Hour, 6, 6 * time.Hour}, // 到顶截断
-		{30 * time.Minute, 6 * time.Hour, 99, 6 * time.Hour},
+// 人工停用的号是"我故意摘的"，探活成功也不该把它放回来。
+func TestProbeOKDoesNotTouchDisabled(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 0)
+	no := false
+	if err := p.Update(k.ID, nil, nil, nil, nil, &no); err != nil {
+		t.Fatal(err)
 	}
-	for _, c := range cases {
-		if got := backoffDur(c.base, c.max, c.hits); got != c.want {
-			t.Errorf("backoffDur(%s, %s, %d) = %s, 想要 %s", c.base, c.max, c.hits, got, c.want)
-		}
+	p.MarkOK(k.ID)
+	if st := p.keys[k.ID].State; st != StateDisabled {
+		t.Fatalf("人工停用的号被探活放回来了，状态 = %s", st)
+	}
+}
+
+// 补额度是欠费号的恢复通道：钱到了就不用人工再点一次。
+func TestAddBudgetRevivesExhausted(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 10)
+	p.Release(acquire(t, p, PickRequest{Model: "m"}),
+		Outcome{Kind: fault.Quota, Message: "402 INSUFFICIENT_BALANCE"})
+	if p.keys[k.ID].State != StateExhausted {
+		t.Fatal("先要进入 exhausted")
+	}
+	p.AddBudget(k.ID, 100)
+	p.ReenableIfCredits(k.ID)
+	got := p.keys[k.ID]
+	if got.State != StateActive || got.QuotaHits != 0 {
+		t.Fatalf("补额后应恢复: state=%s hits=%d", got.State, got.QuotaHits)
+	}
+}
+
+// 补额度不该顺手解开冻结号：那是上游的处罚，充钱没用。
+func TestAddBudgetKeepsBlocked(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 10)
+	p.Release(acquire(t, p, PickRequest{Model: "m"}),
+		Outcome{Kind: fault.Banned, Message: "ACCOUNT_SUSPENDED"})
+	p.AddBudget(k.ID, 100)
+	p.ReenableIfCredits(k.ID)
+	if st := p.keys[k.ID].State; st != StateBlocked {
+		t.Fatalf("补额度把冻结号解开了，状态 = %s", st)
+	}
+}
+
+// 「恢复停用号」把一批欠费/冻结的号一次放回来，但不碰人工停用与 401。
+func TestReviveStoppedBulk(t *testing.T) {
+	p := testPool(t, nil)
+	a := addKey(t, p, "a", 0)
+	b := addKey(t, p, "b", 0)
+	c := addKey(t, p, "c", 0)
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: a.ID}),
+		Outcome{Kind: fault.Quota, Message: "402"})
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: b.ID}),
+		Outcome{Kind: fault.Banned, Message: "403"})
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: c.ID}),
+		Outcome{Kind: fault.Auth, Message: "401"})
+
+	names := p.ReviveStopped()
+	if len(names) != 2 {
+		t.Fatalf("恢复了 %d 个 (%v), 想要 2（a 欠费 + b 冻结）", len(names), names)
+	}
+	if st := p.keys[a.ID].State; st != StateActive {
+		t.Fatalf("a 应恢复，实际 %s", st)
+	}
+	if st := p.keys[b.ID].State; st != StateActive {
+		t.Fatalf("b 应恢复，实际 %s", st)
+	}
+	if st := p.keys[c.ID].State; st != StateInvalid {
+		t.Fatalf("401 的号不该被恢复，实际 %s", st)
+	}
+}
+
+// 预热/自动探活不该去打停用号：那既不会让它们复活，又白烧上游配额。
+func TestEnabledKeysSkipsStopped(t *testing.T) {
+	p := testPool(t, nil)
+	a := addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: a.ID}),
+		Outcome{Kind: fault.Quota, Message: "402"})
+
+	views := p.EnabledKeys()
+	if len(views) != 1 || views[0].State != string(StateActive) {
+		t.Fatalf("EnabledKeys 只应包含能派单的号，实际 %+v", views)
 	}
 }

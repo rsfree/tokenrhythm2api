@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"time"
 
 	"trpool/internal/fault"
@@ -100,11 +101,11 @@ func (p *Pool) MarkFail(id string, o Outcome) {
 	p.notify()
 }
 
-// MarkOK 供探活成功使用：只清 invalid 与"最近错误"，不动冷却与熔断。
+// MarkOK 供探活成功使用：把被判死的号放回来，并清掉"最近错误"。
 //
-// 为什么不 Reset 整号：/v1/models 通了只说明"这个号能取模型列表"，
-// 不代表 chat 可用（模型级灰度、账号级限流都可能只拦生成接口）。
-// 让业务请求替我们验证，比探活提前放行安全。
+// 它是 exhausted / blocked 唯一的自动判定通道，但**只在人工点「探活」时触发**
+// （自动探活只探 invalid，自动预热成功不调本方法）。所以"触发即停用、永不自动复用"
+// 依然成立：停用的号不会自己回来，必须有人明确说"我充好钱了/解封了，试试"。
 func (p *Pool) MarkOK(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -113,8 +114,20 @@ func (p *Pool) MarkOK(id string) {
 		return
 	}
 	k.LastOKAt = time.Now()
-	if k.State == StateInvalid {
+	switch k.State {
+	case StateInvalid, StateExhausted, StateBlocked:
+		if !k.Enabled {
+			return
+		}
 		k.State = StateActive
+		k.CooldownUntil = time.Time{}
+		k.CooldownReason = ""
+		k.FailStreak = 0
+		k.RateStreak = 0
+		k.QuotaHits = 0
+		k.BanHits = 0
+		k.BreakerUntil = time.Time{}
+		k.BreakerCount = 0
 		k.LastError = ""
 	}
 	p.refreshBatchLocked(time.Now())
@@ -138,8 +151,8 @@ func (p *Pool) ClearModelBlock(id, model string) {
 	}
 }
 
-// ReenableIfCredits 在人工补额/校准后解冻"余额耗尽"类冷却。
-// 只解 exhausted 且冷却已到期的那部分：软限流的恢复证据是上游重置时刻，不是余额。
+// ReenableIfCredits 在人工补额/校准后解冻"余额耗尽"的号。
+// 只解 exhausted：冻结（blocked）只能由上游解封，补钱没意义。
 func (p *Pool) ReenableIfCredits(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -151,6 +164,8 @@ func (p *Pool) ReenableIfCredits(id string) {
 		k.State = StateActive
 		k.CooldownUntil = time.Time{}
 		k.CooldownReason = ""
+		k.QuotaHits = 0
+		k.LastError = ""
 		p.refreshBatchLocked(time.Now())
 		p.notify()
 	}
@@ -172,31 +187,27 @@ func (p *Pool) applyFailLocked(k *Key, o Outcome, now time.Time, escalate bool) 
 		k.CooldownReason = "密钥失效（401）"
 
 	case fault.Quota:
-		// 余额不足：充钱就能活，所以不是"永久报废"，但也不能每 30 分钟
-		// 拉回来撞一次——100 个号 99 个没钱时，那会变成每半小时一轮的
-		// 无效请求波。按连续欠费次数指数放大，封顶 ExhaustedMax。
+		// 余额不足是账号级不可用，不是"过一会儿就好"：直接停用，不再自动复活。
+		//
+		// 为什么不留冷却：100 个号 99 个没充值时，任何定时拉回都只是把同一批
+		// 无效请求重演一遍，还白占活跃窗口的名额。停用后要恢复只有两条人工通道：
+		// 补额度（ReenableIfCredits）或点「恢复」/「探活」。
 		if escalate {
 			k.QuotaHits++
 		}
-		d := backoffDur(p.cfg.ExhaustedCooldown.Duration(), p.cfg.ExhaustedMax.Duration(), k.QuotaHits)
 		k.State = StateExhausted
-		k.CooldownUntil = now.Add(d)
-		k.CooldownReason = firstNonEmpty(o.Message, "余额不足（402）")
+		k.CooldownUntil = time.Time{} // 零值 = Tick 永不复活
+		k.CooldownReason = withHint(firstNonEmpty(o.Message, "余额不足（402）"), "已停用，充值后点「恢复」")
 
 	case fault.Banned:
-		// 403 ACCOUNT_SUSPENDED：账号级冻结。换号有意义（Retryable），
-		// 但这个号只能等上游解封，按更长档位退避。
+		// 403 ACCOUNT_SUSPENDED：账号被平台冻结，同样直接停用。
+		// 它比欠费更不可能自愈（解封时间由上游决定），留着冷却只是反复撞墙。
 		if escalate {
 			k.BanHits++
 		}
-		d := backoffDur(p.cfg.BannedCooldown.Duration(), p.cfg.BannedMax.Duration(), k.BanHits)
-		// 上游明确给了恢复时间就至少等那么久（冻结类错误很少给，给了就别浪费）。
-		if o.RetryAfter > d {
-			d = o.RetryAfter
-		}
 		k.State = StateBlocked
-		k.CooldownUntil = now.Add(d)
-		k.CooldownReason = firstNonEmpty(o.Message, "账号被冻结（403）")
+		k.CooldownUntil = time.Time{}
+		k.CooldownReason = withHint(firstNonEmpty(o.Message, "账号被冻结（403）"), "已停用，解封后点「恢复」")
 
 	case fault.Rate:
 		// 上游给了恢复时间就照它来；只有"没给"的时候才指数退避。
@@ -312,31 +323,20 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// withHint 在状态原因后面补一句"怎么恢复"，面板上直接显示，省得去翻文档。
+func withHint(reason, hint string) string {
+	if reason == "" {
+		return hint
+	}
+	if strings.Contains(reason, hint) {
+		return reason
+	}
+	return truncate(reason, 160) + " · " + hint
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
-}
-
-// backoffDur 按命中次数指数放大冷却：hits<=1 用起点，2 倍、4 倍…到 max 截断。
-// hits 会随"欠费/冻结"次数累积，只在成功后清零，所以稳定欠费的号会越来越安静。
-func backoffDur(base, max time.Duration, hits int) time.Duration {
-	if base <= 0 {
-		base = 30 * time.Second
-	}
-	if hits < 1 {
-		hits = 1
-	}
-	d := base
-	for i := 1; i < hits && i <= 8; i++ {
-		d *= 2
-		if max > 0 && d >= max {
-			return max
-		}
-	}
-	if max > 0 && d > max {
-		d = max
-	}
-	return d
 }

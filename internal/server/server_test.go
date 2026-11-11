@@ -103,7 +103,6 @@ func newHarness(t *testing.T, tune func(*config.PoolConfig)) *harness {
 	cfg.Pool.FallbackProbe = false
 	cfg.Pool.RateCooldown = config.Duration(10 * time.Second)
 	cfg.Pool.RateMax = config.Duration(time.Minute)
-	cfg.Pool.ExhaustedCooldown = config.Duration(time.Minute)
 	cfg.Pool.ModelBlockBase = config.Duration(time.Hour)
 	if tune != nil {
 		tune(&cfg.Pool)

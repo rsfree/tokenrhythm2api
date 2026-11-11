@@ -254,8 +254,9 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 启动时并发探一遍所有启用的号（默认 4 并发），**探出坏号直接写进状态**，让第一波业务请求
 不必自己试错。只打 `/v1/models`，不消耗生成额度。
 
-实测：某次启动时两个号已被上游 `ACCOUNT_SUSPENDED` 冻结，预热直接判为 `blocked`（冻结），
-随后 3 个业务请求全部 `attempt=1` 一次成功。
+实测：某次启动时两个号已被上游 `ACCOUNT_SUSPENDED` 冻结，预热直接判为 `blocked`（冻结并停用），
+随后 3 个业务请求全部 `attempt=1` 一次成功。停用的号不会再进预热（`EnabledKeys` 已排除），
+不会每轮白打一遍上游。
 
 ---
 
@@ -268,10 +269,10 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 |---|---|---|---|
 | 2xx | — | 失败计数清零，回到 `active` | — |
 | 401 | `auth` | `invalid`，不自动恢复，需人工重置 | 是 |
-| 402 | `quota` | `exhausted`（余额不足），冷却 `exhausted_cooldown`，反复欠费按次数翻倍到 `_max` | 是 |
-| **403 + `ACCOUNT_SUSPENDED`** | `banned` | `blocked`（账号被冻结），冷却 `banned_cooldown` 起指数退避；**不计入 429 压力** | 是 |
+| 402 / body 含 `INSUFFICIENT_BALANCE` | `quota` | `exhausted`（余额耗尽）**命中即停用**，不设冷却、不会自动复活；充值后补额度或点「恢复」 | 是 |
+| **403 + `ACCOUNT_SUSPENDED`** | `banned` | `blocked`（账号已冻结）**命中即停用**；**不计入 429 压力**，解封后点「恢复」 | 是 |
 | **403 + `MODEL_ACCESS_DENIED`** | `model_denied` | **只封「号 × 模型」**，6h 起指数退避 | 是 |
-| 403 其它 | `quota` | 保守按欠费处理 | 是 |
+| 403 其它 | `quota` | 保守按欠费处理（停用） | 是 |
 | **429 + `RATE_LIMITED`** | `rate` | `cooling`，按 `retryAfterSeconds` 精确冷却 | 是 |
 | **429 + `UPSTREAM_RATE_LIMITED`** | `upstream_rate` | **只冷「号 × 模型」**（30s），优先同号重试 | 是 |
 | 429 无标记 | `rate` | 同上，无提示时 20s 起指数退避 | 是 |
@@ -301,14 +302,25 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 封禁状态在账号池页以 `M 模型名` 药丸展示，可单条清除
 （`DELETE /panel/api/keys/{id}/models?model=xxx`），不必重置整号。
 
-### 熔断与冷却解耦
+### 停用 / 冷却 / 熔断三层
 
-- **冷却**（`cooldown_until`）回答"这个号现在能不能用"，一次性事件（429、402、超时）触发。
+- **停用**（`exhausted` 欠费、`blocked` 冻结）回答"这个号还能不能用"。402 `INSUFFICIENT_BALANCE`
+  与 403 `ACCOUNT_SUSPENDED` 一命中就落这里，**没有冷却、不会自动复活**，也不再被选中、
+  不再进活跃窗口、不再被预热去打。
+- **冷却**（`cooldown_until`）回答"这个号现在能不能用"，一次性事件（429、模型侧限流、超时）触发，
+  到期自动恢复派单。
 - **熔断**（`breaker_until`）回答"这个号是不是持续在坏"，由 `FailStreak ≥ breaker_threshold` 触发。
 
-两者独立计时：冷却到期就恢复派单，但熔断期间仍会被跳过。这样"偶发 429"不会把号永久打入冷宫，
-"连续 5xx"也不会因为冷却到期就立刻满血复活。`RateStreak` 单独计数，
-429 的退避次数不会被 `FailStreak` 污染（否则一串 429 会把号推成熔断）。
+为什么欠费/冻结不留冷却：定时把号放回来只是在重演同一批无效请求，还白占活跃窗口名额。
+100 个号 99 个没充值时，那会变成每半小时一轮的撞墙。恢复必须有人明确表态，三条通道：
+
+| 场景 | 操作 |
+|---|---|
+| 充值后 | 补额度（`POST /panel/api/keys/{id}/budget`）→ 欠费号自动恢复 |
+| 批量充值后 | 号池右上「恢复停用号」（`POST /panel/api/keys/revive`）一次放回来 |
+| 确认已解封 | 单号「探活」成功，或「重置」 |
+
+冻结号（`blocked`）不会被补额度解开——那是上游的处罚，充钱没用；人工停用的号也不会被探活放回来。
 
 ### 重试边界
 
@@ -352,7 +364,7 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 - **日账一个请求只记一次**（重试不重复计费），但**日志每次尝试都留一条**，方便区分"贵"和"重试多"。
 - 日账按 `Asia/Shanghai` 切日（Dockerfile 里装了 tzdata，否则跨零点会算到前一天）。
 
-余额触底（`credit_floor`，默认 ¥0.5）或上游回 402 后号码停止派单（`exhausted`）；
+余额触底（`credit_floor`，默认 ¥0.5）或上游回 402 后号码**直接停用**（`exhausted`，不会自动复活）；
 面板里补一笔充值额（`POST /panel/api/keys/{id}/budget {delta}`）会自动复活。
 
 ---
@@ -455,7 +467,8 @@ POST   /panel/api/keys/{id}/reset               # 清冷却/熔断/封禁/失败
 POST   /panel/api/keys/{id}/probe               # 单号探活
 POST   /panel/api/keys/{id}/budget  {delta}     # 调整充值额（¥）
 DELETE /panel/api/keys/{id}/models?model=xxx    # 解除单模型封禁
-POST   /panel/api/keys/probe                    # 全池探活
+POST   /panel/api/keys/probe                    # 全池探活（跳过人工停用的号）
+POST   /panel/api/keys/revive                   # 批量恢复因欠费/冻结停用的号
 PUT    /panel/api/pool                          # 热更新调度参数
 POST   /panel/api/prices                        # 刷新价目表
 GET    /panel/api/config                        # 运行时信息
@@ -492,8 +505,6 @@ GET    /panel/api/config                        # 运行时信息
 | `pool.max_in_flight_global` | 0 | 全池在途上限（0 = 不限） |
 | `pool.breaker_threshold` | 3 | 连续失败多少次熔断 |
 | `pool.rate_cooldown` / `_max` | 20s / 10m | 429 冷却起点与上限 |
-| `pool.exhausted_cooldown` / `_max` | 30m / 6h | 402 余额不足的冷却起点与上限（反复欠费按次数翻倍） |
-| `pool.banned_cooldown` / `_max` | 30m / 12h | 403 账号冻结的冷却起点与上限，与 429 分开 |
 | `pool.model_block_base` / `_max` | 6h / 24h | 模型级封禁的指数退避区间 |
 | `pool.model_rate_cooldown` | 30s | 供应链限流的 `(号, 模型)` 短冷 |
 | `pool.credit_floor` | 0.5 | 余额低于此值且模型收费则不派单（0 = 关闭） |

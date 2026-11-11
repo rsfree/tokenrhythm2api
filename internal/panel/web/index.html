@@ -125,7 +125,7 @@
           <section class="panel">
             <div class="panel-head">
               <h2>号池</h2>
-              <div class="panel-actions"><button class="btn ghost small" id="btnAddToggle">+ 添加号</button></div>
+              <div class="panel-actions"><button class="btn ghost small" id="btnRevive">恢复停用号</button><button class="btn ghost small" id="btnAddToggle">+ 添加号</button></div>
             </div>
 
             <form class="add-form" id="addForm" hidden>
@@ -285,8 +285,6 @@
               <label>余额保底 ¥<input type="number" id="pFloor" step="0.1" min="0"></label>
               <label>闲置权重 / 小时<input type="number" id="pIdle" step="0.1" min="0"></label>
               <label>429 冷却（秒）<input type="number" id="pRate" min="1"></label>
-              <label>欠费冷却（分）<input type="number" id="pExhaust" min="1"></label>
-              <label>冻结冷却（分）<input type="number" id="pBan" min="1"></label>
               <label>熔断冷却（秒）<input type="number" id="pBreaker" min="1"></label>
               <label>在途惩罚系数<input type="number" id="pInflight" step="0.5" min="0"></label>
               <label>会话粘性

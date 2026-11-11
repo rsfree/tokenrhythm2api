@@ -259,10 +259,23 @@ func (p *Pool) Update(id string, name, secret *string, weight, budget *float64, 
 	}
 	if enabled != nil {
 		k.Enabled = *enabled
-		if *enabled && k.State == StateDisabled {
-			k.State = StateActive
-		}
-		if !*enabled {
+		if *enabled {
+			// 「启用」是人工表态：把欠费/冻结/失效的判断一起撤掉，
+			// 否则会停在"已启用但永远不派单"的怪状态。
+			switch k.State {
+			case StateDisabled, StateInvalid, StateExhausted, StateBlocked:
+				k.State = StateActive
+				k.CooldownUntil = time.Time{}
+				k.CooldownReason = ""
+				k.FailStreak = 0
+				k.RateStreak = 0
+				k.QuotaHits = 0
+				k.BanHits = 0
+				k.BreakerUntil = time.Time{}
+				k.BreakerCount = 0
+				k.LastError = ""
+			}
+		} else {
 			k.State = StateDisabled
 		}
 	}
@@ -293,6 +306,42 @@ func (p *Pool) Remove(id string) bool {
 	p.refreshBatchLocked(time.Now())
 	p.notify()
 	return true
+}
+
+// ReviveStopped 一次性把因欠费/冻结停用的号全部拉回 active。
+//
+// 给"充完值回来了"这种批量场景用：20 个号补完值再一个个点恢复太蠢。
+// 只动 exhausted/blocked，不碰人工停用（disabled）与 401（密钥真的废了）。
+// 返回被恢复的号名，方便面板告知"回来了几个"。
+func (p *Pool) ReviveStopped() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var names []string
+	for _, id := range p.order {
+		k := p.keys[id]
+		if k == nil || !k.Enabled {
+			continue
+		}
+		if k.State != StateExhausted && k.State != StateBlocked {
+			continue
+		}
+		k.State = StateActive
+		k.CooldownUntil = time.Time{}
+		k.CooldownReason = ""
+		k.FailStreak = 0
+		k.RateStreak = 0
+		k.QuotaHits = 0
+		k.BanHits = 0
+		k.BreakerUntil = time.Time{}
+		k.BreakerCount = 0
+		k.LastError = ""
+		names = append(names, k.Name)
+	}
+	if len(names) > 0 {
+		p.refreshBatchLocked(time.Now())
+		p.notify()
+	}
+	return names
 }
 
 // Reset 人工恢复：把 invalid/exhausted/cooling 拉回 active，并清掉熔断与模型封禁。
@@ -417,14 +466,17 @@ func (p *Pool) StickyTotal() int {
 // ---------- 周期任务 ----------
 
 // Tick 把自然到期的冷却号拉回 active，清理过期模型封禁与粘性。
+//
+// 只有 cooling（429/模型限流这类"过一会儿就好"的）会自然到期。
+// exhausted（欠费）与 blocked（冻结）是停用终态，走到这里一律不动：
+// 它们只能由人工恢复（补额度 / 「恢复」 / 「探活」）。
 func (p *Pool) Tick() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	changed := false
 	for _, k := range p.keys {
-		if (k.State == StateCooling || k.State == StateExhausted || k.State == StateBlocked) &&
-			!k.CooldownUntil.IsZero() && !now.Before(k.CooldownUntil) {
+		if k.State == StateCooling && !k.CooldownUntil.IsZero() && !now.Before(k.CooldownUntil) {
 			k.State = StateActive
 			k.CooldownUntil = time.Time{}
 			k.CooldownReason = ""
@@ -481,14 +533,22 @@ func (p *Pool) SecretOf(id string) (string, bool) {
 	return k.Secret, true
 }
 
-// EnabledKeys 返回可参与探活/刷价的号（不看冷却，只看是否被人工停用或判死）。
+// EnabledKeys 返回值得去探的号：启用的、还没被判死的。
+//
+// 排除 exhausted/blocked 是有意的：它们是停用终态，探通也不会自动复活，
+// 自动预热没必要每轮去打这批号（19 个欠费号 × 每轮预热 = 白烧上游配额）。
 func (p *Pool) EnabledKeys() []View {
 	all := p.Views()
 	out := make([]View, 0, len(all))
 	for _, v := range all {
-		if v.Enabled && v.State != "invalid" && v.State != "disabled" {
-			out = append(out, v)
+		if !v.Enabled {
+			continue
 		}
+		switch State(v.State) {
+		case StateDisabled, StateInvalid, StateExhausted, StateBlocked:
+			continue
+		}
+		out = append(out, v)
 	}
 	return out
 }
@@ -641,7 +701,7 @@ func (p *Pool) Views() []View {
 		if !k.LastOKAt.IsZero() {
 			v.LastOKAt = k.LastOKAt.Format(time.RFC3339)
 		}
-		if k.State == StateCooling || k.State == StateExhausted || k.State == StateBlocked {
+		if k.State == StateCooling {
 			if d := int(k.CooldownUntil.Sub(now).Seconds()); d > 0 {
 				v.CooldownLeft = d
 			}
