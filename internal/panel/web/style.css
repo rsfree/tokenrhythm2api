@@ -317,3 +317,7 @@ input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px 
   .topbar { flex-wrap: wrap; }
   .view .panel-actions { flex-wrap: wrap; }
 }
+
+/* 模型级封禁 / 熔断标记：只在这两种状态下出现，不占额外面板空间 */
+.pill.mblk { background: #fff4e5; color: #b54708; }
+.pill.brk { background: #fee4e2; color: #b42318; }

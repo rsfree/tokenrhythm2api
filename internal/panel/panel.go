@@ -1,36 +1,43 @@
-// Package panel 提供号池的管理接口与内嵌前端。
-// 鉴权：Bearer <admin_key>，也接受 ?token=<admin_key>（方便浏览器直开）。
+// Package panel 提供号池的管理 API 与内嵌前端。
+//
+// 鉴权：Authorization: Bearer <admin_key>，也接受 ?token=<admin_key>（浏览器直开）。
+// 前端用 go:embed 打进二进制，零外部依赖、零构建步骤。
 package panel
 
 import (
-	"embed"
+	"context"
 	"encoding/json"
-	"io/fs"
+	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"trpool/internal/capacity"
 	"trpool/internal/config"
-	"trpool/internal/ledger"
+	"trpool/internal/fault"
+	"trpool/internal/httpauth"
+	"trpool/internal/livecfg"
 	"trpool/internal/pool"
+	"trpool/internal/reqlog"
 	"trpool/internal/upstream"
+	"trpool/internal/usage"
 )
 
-//go:embed web/*
-var webFS embed.FS
-
 type Deps struct {
-	Cfg     *config.Config
-	Pool    *pool.Pool
-	Version string // 由 cmd 注入，面板上用来确认"线上跑的到底是哪个版本"
-	Prices  *ledger.Prices
-	Log     *ledger.Log
-	Daily   *ledger.Daily
-	Up      *upstream.Client
-	Stats   func() map[string]int64
-	Uptime  func() time.Duration
-	Persist func() // 把当前配置/状态写盘
+	Cfg        *config.Config
+	Live       *livecfg.Holder
+	Pool       *pool.Pool
+	Prices     *usage.Prices
+	Log        *reqlog.Recorder
+	Daily      *usage.Daily
+	Up         *upstream.Client
+	Version    string
+	ConfigPath string
+	Stats      func() map[string]int64
+	Uptime     func() time.Duration
+	Persist    func() // 标脏落盘（状态文件）
 }
 
 type Panel struct {
@@ -40,15 +47,17 @@ type Panel struct {
 
 func New(d Deps) *Panel {
 	p := &Panel{d: d, mux: http.NewServeMux()}
-	sub, _ := fs.Sub(webFS, "web")
-	p.mux.Handle("/panel/", http.StripPrefix("/panel", http.FileServer(http.FS(sub))))
+	p.mux.HandleFunc("/panel/", p.handleIndex)
 	p.mux.HandleFunc("/panel/api/state", p.guard(p.handleState))
+	p.mux.HandleFunc("/panel/api/logs", p.guard(p.handleLogs))
+	p.mux.HandleFunc("/panel/api/capacity", p.guard(p.handleCapacity))
+	p.mux.HandleFunc("/panel/api/models", p.guard(p.handleModels))
 	p.mux.HandleFunc("/panel/api/keys", p.guard(p.handleKeys))
+	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
 	p.mux.HandleFunc("/panel/api/keys/", p.guard(p.handleKeyItem))
 	p.mux.HandleFunc("/panel/api/pool", p.guard(p.handlePool))
-	p.mux.HandleFunc("/panel/api/keys/probe", p.guard(p.handleProbeAll))
 	p.mux.HandleFunc("/panel/api/prices", p.guard(p.handlePrices))
-	p.mux.HandleFunc("/panel/api/logs", p.guard(p.handleLogs))
+	p.mux.HandleFunc("/panel/api/config", p.guard(p.handleConfig))
 	return p
 }
 
@@ -57,13 +66,13 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) { p.mux.ServeH
 func (p *Panel) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok := ""
-		if v := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(v), "bearer ") {
-			tok = strings.TrimSpace(v[7:])
+		if v, ok := httpauth.Credential(r); ok {
+			tok = v
 		}
 		if tok == "" {
 			tok = r.URL.Query().Get("token")
 		}
-		if tok != p.d.Cfg.AdminKey {
+		if !httpauth.VerifyToken(tok, p.d.Live.Load().AdminKey) {
 			writeErr(w, http.StatusUnauthorized, "管理令牌无效")
 			return
 		}
@@ -82,25 +91,25 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"ok": false, "error": msg})
 }
 
+// ---------- 总览 ----------
+
 func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	views := p.d.Pool.Views()
-	var (
-		totalReq    int64
-		totalErr    int64
-		totalSpent  float64
-		totalBudget float64
-		healthy     int
-	)
+	pcfg := p.d.Pool.Config()
+	var totalSpent, totalBudget float64
+	healthy := 0
 	for _, v := range views {
-		totalReq += v.Requests
-		totalErr += v.Errors
 		totalSpent += v.Spent
 		totalBudget += v.Budget
 		if v.Enabled && (v.State == "active" || v.State == "cooling") {
 			healthy++
 		}
 	}
-	cfg := p.d.Pool.Config()
+	reqs, errs, _, _, dailyCost := p.d.Daily.Total()
+	logs := p.d.Log.Recent(80)
+	capSnap := capacity.Compute(views, p.d.Log.Recent(400), pcfg.MaxInFlight, pcfg.KeyQPS, p.d.Uptime())
+	hits, misses := p.d.Pool.Sessions().Stats()
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
 		"version":        p.d.Version,
@@ -109,31 +118,140 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		"data_dir":       p.d.Cfg.DataDir,
 		"auto_probe":     p.d.Cfg.AutoProbe,
 		"logging":        p.d.Cfg.Logging,
+		"archive":        p.d.Log.ArchiveMeta(),
 		"uptime_seconds": int64(p.d.Uptime().Seconds()),
 		"stats":          p.d.Stats(),
 		"keys":           views,
-		"pool":           cfg,
+		"pool":           pcfg,
 		"batch":          p.d.Pool.BatchState(),
-		"client_keys":    p.d.Cfg.ClientKeys,
-		"prices": map[string]any{
-			"count":      p.d.Prices.Count(),
-			"updated_at": p.d.Prices.UpdatedAt().Format(time.RFC3339),
-			// 明细给「模型与档位」页；25 个模型约 4KB，不值得再开一次请求
-			"list": p.d.Prices.Snapshot(),
-		},
+		"client_keys":    p.d.Live.Load().ClientKeys,
+		"prices":         priceBlock(p.d.Prices),
 		"totals": map[string]any{
-			"requests": totalReq, "errors": totalErr,
-			"spent": totalSpent, "budget": totalBudget, "healthy": healthy,
+			"requests": reqs, "errors": errs, "spent": totalSpent, "budget": totalBudget,
+			"healthy": healthy, "cost": dailyCost,
 		},
-		"days": p.d.Daily.Last(14),
-		"logs": p.d.Log.Recent(80),
+		"days":         p.d.Daily.Last(14),
+		"logs":         logs,
+		"capacity":     capSnap,
+		"model_health": p.d.Pool.ModelHealth(),
+		"sessions": map[string]any{
+			"active": p.d.Pool.Sessions().Len(), "hits": hits, "misses": misses,
+		},
 	})
 }
 
-func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request) {
-	n, _ := strconv.Atoi(r.URL.Query().Get("n"))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "logs": p.d.Log.Recent(n)})
+func priceBlock(prices *usage.Prices) map[string]any {
+	meta := prices.Meta()
+	meta["list"] = prices.Snapshot()
+	return meta
 }
+
+// ---------- 日志 ----------
+
+func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	n, _ := strconv.Atoi(q.Get("n"))
+	if n <= 0 {
+		n = 400
+	}
+	if q.Get("history") != "1" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "source": "ring", "logs": p.d.Log.Recent(n)})
+		return
+	}
+	f := reqlog.Filter{
+		Status: q.Get("status"),
+		KeyID:  q.Get("key"),
+		Model:  q.Get("model"),
+		Text:   q.Get("text"),
+		Limit:  n,
+	}
+	if v := q.Get("since"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			f.Since = t
+		}
+	}
+	if v := q.Get("until"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			f.Until = t
+		}
+	}
+	logs, err := p.d.Log.Query(f)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "source": "archive", "logs": logs})
+}
+
+// ---------- 容量 ----------
+
+func (p *Panel) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	pcfg := p.d.Pool.Config()
+	snap := capacity.Compute(p.d.Pool.Views(), p.d.Log.Recent(400), pcfg.MaxInFlight, pcfg.KeyQPS, p.d.Uptime())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "capacity": snap})
+}
+
+// ---------- 模型 ----------
+
+func (p *Panel) handleModels(w http.ResponseWriter, r *http.Request) {
+	logs := p.d.Log.Recent(400)
+	type agg struct {
+		Model    string  `json:"model"`
+		Requests int     `json:"requests"`
+		Errors   int     `json:"errors"`
+		Tokens   int64   `json:"tokens"`
+		Cost     float64 `json:"cost"`
+		Latency  int64   `json:"p95_ms"`
+	}
+	byModel := map[string]*agg{}
+	lat := map[string][]int64{}
+	for _, e := range logs {
+		if e.Model == "" {
+			continue
+		}
+		a := byModel[e.Model]
+		if a == nil {
+			a = &agg{Model: e.Model}
+			byModel[e.Model] = a
+		}
+		a.Requests++
+		if e.Error != "" || e.Status >= 400 {
+			a.Errors++
+		}
+		a.Tokens += e.PromptTokens + e.CompletionTokens
+		a.Cost += e.Cost
+		if e.LatencyMS > 0 && e.Status < 400 {
+			lat[e.Model] = append(lat[e.Model], e.LatencyMS)
+		}
+	}
+	out := make([]*agg, 0, len(byModel))
+	for m, a := range byModel {
+		a.Latency = p95(lat[m])
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Cost > out[j].Cost })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"models":       out,
+		"prices":       priceBlock(p.d.Prices),
+		"model_health": p.d.Pool.ModelHealth(),
+		"window":       len(logs),
+	})
+}
+
+func p95(xs []int64) int64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sort.Slice(xs, func(i, j int) bool { return xs[i] < xs[j] })
+	i := int(float64(len(xs)) * 0.95)
+	if i >= len(xs) {
+		i = len(xs) - 1
+	}
+	return xs[i]
+}
+
+// ---------- 号 ----------
 
 type keyReq struct {
 	Name    string   `json:"name"`
@@ -141,6 +259,8 @@ type keyReq struct {
 	Weight  *float64 `json:"weight"`
 	Budget  *float64 `json:"budget"`
 	Enabled *bool    `json:"enabled"`
+	Model   string   `json:"model"`
+	Delta   *float64 `json:"delta"`
 }
 
 func (p *Panel) handleKeys(w http.ResponseWriter, r *http.Request) {
@@ -165,9 +285,7 @@ func (p *Panel) handleKeys(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if p.d.Persist != nil {
-			p.d.Persist()
-		}
+		p.persist()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": k.ID})
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
@@ -194,9 +312,7 @@ func (p *Panel) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "号不存在")
 			return
 		}
-		if p.d.Persist != nil {
-			p.d.Persist()
-		}
+		p.persist()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	case action == "probe" && r.Method == http.MethodPost:
@@ -205,18 +321,36 @@ func (p *Panel) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "号不存在")
 			return
 		}
-		start := time.Now()
-		_, err := p.d.Up.FetchModels(r.Context(), secret)
-		ms := time.Since(start).Milliseconds()
-		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "latency_ms": ms, "error": err.Error()})
+		res := p.probeOne(r.Context(), id, secret)
+		p.persist()
+		writeJSON(w, http.StatusOK, res)
+
+	case action == "models" && r.Method == http.MethodDelete:
+		model := r.URL.Query().Get("model")
+		if model == "" {
+			writeErr(w, http.StatusBadRequest, "缺少 model 参数")
 			return
 		}
-		p.d.Pool.Reset(id)
-		if p.d.Persist != nil {
-			p.d.Persist()
+		if !p.d.Pool.ResetModel(id, model) {
+			writeErr(w, http.StatusNotFound, "号不存在")
+			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "latency_ms": ms})
+		p.persist()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+
+	case action == "budget" && r.Method == http.MethodPost:
+		var req keyReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Delta == nil {
+			writeErr(w, http.StatusBadRequest, "需要 delta")
+			return
+		}
+		if !p.d.Pool.AddBudget(id, *req.Delta) {
+			writeErr(w, http.StatusNotFound, "号不存在")
+			return
+		}
+		p.d.Pool.ReenableIfCredits(id)
+		p.persist()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	case r.Method == http.MethodPatch || r.Method == http.MethodPut:
 		var req keyReq
@@ -235,9 +369,8 @@ func (p *Panel) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if p.d.Persist != nil {
-			p.d.Persist()
-		}
+		p.d.Pool.ReenableIfCredits(id)
+		p.persist()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	case r.Method == http.MethodDelete:
@@ -245,9 +378,7 @@ func (p *Panel) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "号不存在")
 			return
 		}
-		if p.d.Persist != nil {
-			p.d.Persist()
-		}
+		p.persist()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	default:
@@ -255,7 +386,62 @@ func (p *Panel) handleKeyItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handlePool 热更新调度参数，并写回配置文件。
+type probeResult struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	OK      bool   `json:"ok"`
+	Latency int64  `json:"latency_ms"`
+	Error   string `json:"error,omitempty"`
+}
+
+// probeOne 打一次 /v1/models：只读，不消耗生成额度。
+// 成功只清 invalid（models 通了不代表 chat 通了），失败按类别落号状态。
+func (p *Panel) probeOne(ctx context.Context, id, secret string) probeResult {
+	name := id
+	for _, v := range p.d.Pool.Views() {
+		if v.ID == id {
+			name = v.Name
+			break
+		}
+	}
+	start := time.Now()
+	c, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	_, err := p.d.Up.FetchModels(c, secret)
+	res := probeResult{ID: id, Name: name, OK: err == nil, Latency: time.Since(start).Milliseconds()}
+	if err == nil {
+		p.d.Pool.MarkOK(id)
+		return res
+	}
+	res.Error = err.Error()
+	var se *upstream.StatusError
+	if errors.As(err, &se) {
+		v := fault.Classify(se.Status, se.Body, nil)
+		p.d.Pool.MarkFail(id, pool.Outcome{Kind: v.Kind, Message: v.Message, RetryAfter: v.RetryAfter})
+	}
+	return res
+}
+
+func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
+		return
+	}
+	out := make([]probeResult, 0)
+	for _, k := range p.d.Pool.Views() {
+		secret, ok := p.d.Pool.SecretOf(k.ID)
+		if !ok {
+			continue
+		}
+		out = append(out, p.probeOne(r.Context(), k.ID, secret))
+	}
+	p.persist()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out})
+}
+
+// ---------- 调度参数 ----------
+
+// handlePool 热更新调度参数，并写回配置文件的 pool 段（密钥不落盘）。
 func (p *Panel) handlePool(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
@@ -272,37 +458,71 @@ func (p *Panel) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "strategy 只能是 weighted_random / round_robin / sequential")
 		return
 	}
+	// 未传的字段用当前值兜底，避免前端少传一项就把冷却清零。
+	cur := p.d.Pool.Config()
 	if in.TopK <= 0 {
-		in.TopK = 5
+		in.TopK = cur.TopK
 	}
 	if in.RetryMax <= 0 {
-		in.RetryMax = 1
+		in.RetryMax = cur.RetryMax
 	}
 	if in.UpstreamTimeout.Duration() <= 0 {
-		in.UpstreamTimeout = p.d.Cfg.Pool.UpstreamTimeout
+		in.UpstreamTimeout = cur.UpstreamTimeout
 	}
 	if in.VideoTimeout.Duration() <= 0 {
-		in.VideoTimeout = p.d.Cfg.Pool.VideoTimeout
+		in.VideoTimeout = cur.VideoTimeout
 	}
 	if in.StickyTTL.Duration() <= 0 {
-		in.StickyTTL = p.d.Cfg.Pool.StickyTTL
+		in.StickyTTL = cur.StickyTTL
 	}
+	if in.RateCooldown.Duration() <= 0 {
+		in.RateCooldown = cur.RateCooldown
+	}
+	if in.RateMax.Duration() <= 0 {
+		in.RateMax = cur.RateMax
+	}
+	if in.BreakerCooldown.Duration() <= 0 {
+		in.BreakerCooldown = cur.BreakerCooldown
+	}
+	if in.ExhaustedCooldown.Duration() <= 0 {
+		in.ExhaustedCooldown = cur.ExhaustedCooldown
+	}
+	if in.ModelBlockBase.Duration() <= 0 {
+		in.ModelBlockBase = cur.ModelBlockBase
+	}
+	if in.ModelBlockMax.Duration() <= 0 {
+		in.ModelBlockMax = cur.ModelBlockMax
+	}
+	if in.ModelRateCooldown.Duration() <= 0 {
+		in.ModelRateCooldown = cur.ModelRateCooldown
+	}
+	if in.KeyQPS <= 0 {
+		in.KeyQPS = cur.KeyQPS
+	}
+	if in.SessionSticky.TTL.Duration() <= 0 {
+		in.SessionSticky.TTL = cur.SessionSticky.TTL
+	}
+	if in.SessionSticky.MaxEntries <= 0 {
+		in.SessionSticky.MaxEntries = cur.SessionSticky.MaxEntries
+	}
+	if in.Batch.TargetInflightPerKey <= 0 {
+		in.Batch.TargetInflightPerKey = cur.Batch.TargetInflightPerKey
+	}
+
 	p.d.Pool.SetConfig(in)
-	p.d.Cfg.Pool = in
-	if p.d.Persist != nil {
-		p.d.Persist()
+	if err := config.WritePool(p.d.ConfigPath, in); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pool": p.d.Pool.Config(), "warning": "写回配置文件失败: " + err.Error()})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pool": in})
+	p.persist()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pool": p.d.Pool.Config()})
 }
+
+// ---------- 价目表 ----------
 
 func (p *Panel) handlePrices(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"count":      p.d.Prices.Count(),
-			"updated_at": p.d.Prices.UpdatedAt().Format(time.RFC3339),
-			"list":       p.d.Prices.Snapshot(),
-		})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "prices": priceBlock(p.d.Prices)})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -321,12 +541,14 @@ func (p *Panel) handlePrices(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		tried++
-		body, err := p.d.Up.FetchModels(r.Context(), secret)
+		c, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		body, err := p.d.Up.FetchModels(c, secret)
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if err := p.d.Prices.Load(body); err != nil {
+		if err := p.d.Prices.Load(body, k.Name); err != nil {
 			lastErr = err
 			continue
 		}
@@ -337,39 +559,29 @@ func (p *Panel) handlePrices(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "池内没有可用号，无法拉取价目表")
 		return
 	}
-	writeErr(w, http.StatusBadGateway, "所有号都拉不到价目表: "+lastErr.Error())
+	msg := "所有号都拉不到价目表"
+	if lastErr != nil {
+		msg += ": " + lastErr.Error()
+	}
+	writeErr(w, http.StatusBadGateway, msg)
 }
 
-func (p *Panel) handleProbeAll(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
-		return
-	}
-	type res struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		OK      bool   `json:"ok"`
-		Latency int64  `json:"latency_ms"`
-		Error   string `json:"error,omitempty"`
-	}
-	var out []res
-	for _, k := range p.d.Pool.Views() {
-		secret, ok := p.d.Pool.SecretOf(k.ID)
-		if !ok {
-			continue
-		}
-		start := time.Now()
-		_, err := p.d.Up.FetchModels(r.Context(), secret)
-		item := res{ID: k.ID, Name: k.Name, OK: err == nil, Latency: time.Since(start).Milliseconds()}
-		if err != nil {
-			item.Error = err.Error()
-		} else {
-			p.d.Pool.Reset(k.ID)
-		}
-		out = append(out, item)
-	}
+// ---------- 配置 ----------
+
+func (p *Panel) handleConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := *p.d.Cfg
+	cfg.AdminKey = ""
+	cfg.ClientKeys = nil
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"config":  cfg,
+		"pool":    p.d.Pool.Config(),
+		"version": p.d.Version,
+	})
+}
+
+func (p *Panel) persist() {
 	if p.d.Persist != nil {
 		p.d.Persist()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out})
 }

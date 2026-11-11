@@ -19,6 +19,8 @@ const state = {
   timer: null,
   formDirty: false,
   filters: { status: 'all', key: 'all', model: 'all', text: '' },
+  history: false,          // 是否查 JSONL 归档（跨重启/跨天）
+  historyAt: 0,
 };
 
 const VIEW_META = {
@@ -258,7 +260,6 @@ function renderActive() {
 }
 
 function renderChrome(d) {
-  $('upstreamTag') && ($('upstreamTag').textContent = d.upstream || '');
   $('uptime').textContent = '运行 ' + fmtDur(d.uptime_seconds || 0);
   $('navVer').textContent = (d.version || 'dev') + ' · ' + (d.upstream || '').replace(/^https?:\/\//, '');
   $('navVer').title = $('navVer').textContent;
@@ -274,7 +275,9 @@ function renderOverview() {
   $('kTotal').textContent = (d.keys || []).length;
   $('kRequests').textContent = compact(t.requests || 0);
   // 用账本口径（持久化）而不是进程内计数器：后者一重启就归零，看着像"没有流量"。
-  const okN = t.requests || 0, errN = t.errors || 0, allN = okN + errN;
+  const errN = t.errors || 0;
+  const okN = Math.max(0, (t.requests || 0) - errN);
+  const allN = t.requests || 0;
   $('kSuccess').textContent = allN
     ? `成功率 ${((okN / allN) * 100).toFixed(1)}% · 失败 ${errN}`
     : '成功率 —';
@@ -323,16 +326,21 @@ function renderBatchKv(d) {
 }
 
 function renderErrFeed(d) {
+  const mh = (d.model_health || []);
+  const mhHtml = mh.length ? `<div class="feed-item">
+      <div class="top"><span class="chip bad">MODEL</span><strong>${mh.length} 个模型被部分号封禁</strong></div>
+      <div class="msg">${mh.map((h) => `${esc(h.model)} · ${h.keys} 个号 · ${h.kind === 'denied' ? '未开通' : '限流'} · 最早 ${h.earliest_left ? fmtDur(h.earliest_left) : '—'} 恢复`).join('；')}</div>
+    </div>` : '';
   const scanned = (d.logs || []).length;
   const bad = (d.logs || []).filter((l) => l.error || (l.status >= 400)).slice(0, 8);
   if (!bad.length) {
     // 说清窗口：累计失败数可能是历史账本里的，日志环只覆盖最近若干条
-    $('errFeed').innerHTML = scanned
+    $('errFeed').innerHTML = mhHtml + (scanned
       ? `<div class="empty">最近 ${scanned} 条请求里没有失败 👍</div>`
-      : '<div class="empty">重启后还没有新请求（历史失败计入账本，但不进日志环）</div>';
+      : '<div class="empty">重启后还没有新请求（历史失败计入账本，但不进日志环）</div>');
     return;
   }
-  $('errFeed').innerHTML = bad.map((l) => `
+  $('errFeed').innerHTML = mhHtml + bad.map((l) => `
     <div class="feed-item">
       <div class="top">
         <span class="chip bad">${l.status || 'ERR'}</span>
@@ -357,9 +365,12 @@ function renderAccounts() {
     const errLine = k.last_error
       ? `<div class="err-line" title="${esc(k.last_error)}">${esc(k.last_error.slice(0, 30))}${k.last_error.length > 30 ? '…' : ''}</div>`
       : '';
+    const blocks = (k.model_blocks || []);
     const pills = [
       k.in_batch ? '<span class="pill on" title="当前 batch 成员">B</span>' : '',
       k.sessions > 0 ? `<span class="pill sess" title="${k.sessions} 个会话粘在此号">${k.sessions}</span>` : '',
+      blocks.length ? `<span class="pill mblk" title="模型级封禁：${esc(blocks.map((b) => b.model + (b.kind === 'denied' ? '（未开通）' : '（限流）')).join(' / '))}">M${blocks.length}</span>` : '',
+      k.breaker_left > 0 ? `<span class="pill brk" title="熔断剩余 ${fmtDur(k.breaker_left)}">断</span>` : '',
     ].join('');
     return `<tr data-id="${esc(k.id)}">
       <td><div class="name-cell">${esc(k.name)}${pills}</div><div class="mask">${esc(k.masked)}</div>${errLine}</td>
@@ -465,58 +476,57 @@ function latencyStats(entries) {
 
 function renderCapacity() {
   const d = state.data;
-  const keys = d.keys || [];
-  const pool = d.pool || {};
-  const okKeys = keys.filter((k) => k.enabled && (k.state === 'active' || k.state === 'cooling'));
-  const logs = d.logs || [];
-  const st = latencyStats(logs);
-
-  // 上游实测：每号 30 次 / 约 15 秒 ≈ 2 QPS
-  const QPS_PER_KEY = 2;
-  const safePerKey = st.p50 ? Math.max(1, Math.round(QPS_PER_KEY * (st.p50 / 1000))) : 0;
-
-  $('cKeys').textContent = okKeys.length;
-  $('cKeysSub').textContent = `共 ${keys.length} 个号 · 上限 ${pool.max_in_flight ?? '—'}/号`;
-  $('cRpm').textContent = okKeys.length * QPS_PER_KEY * 60;
-  $('cInflightSafe').textContent = safePerKey ? safePerKey * Math.max(1, okKeys.length) : '—';
-  $('cInflightNow').textContent = `当前在途 ${(d.batch || {}).total_inflight ?? 0}`;
-  $('cP95').textContent = st.p95 ? st.p95 + 'ms' : '—';
-  $('cP50').textContent = st.p50 ? `p50 ${st.p50}ms · 样本 ${st.n}` : `p50 — · 样本 ${st.n}`;
-  $('cSafePerKey').textContent = safePerKey ? String(safePerKey) : '（样本不足）';
+  const c = d.capacity;
+  if (!c) {
+    $('capHint').textContent = '后端还没返回容量快照';
+    return;
+  }
+  $('cKeys').textContent = c.healthy;
+  $('cKeysSub').textContent = `共 ${c.keys} 个号 · 上限 ${c.max_per_key || '—'}/号`;
+  $('cRpm').textContent = c.rpm;
+  $('cInflightSafe').textContent = c.safe_total || '—';
+  $('cInflightNow').textContent = `当前在途 ${c.inflight}`;
+  $('cP95').textContent = c.p95_ms ? c.p95_ms + 'ms' : '—';
+  $('cP50').textContent = c.p50_ms ? `p50 ${c.p50_ms}ms · 样本 ${c.samples}` : `p50 — · 样本 ${c.samples}`;
+  $('cSafePerKey').textContent = c.safe_per_key ? String(c.safe_per_key) : '（样本不足）';
 
   const tb = $('capTable').querySelector('tbody');
-  if (!keys.length) {
+  if (!c.per_key || !c.per_key.length) {
     tb.innerHTML = `<tr><td colspan="9"><div class="empty">还没有号。</div></td></tr>`;
   } else {
-    tb.innerHTML = keys.map((k) => {
-      const mine = logs.filter((l) => l.key_id === k.id);
-      const s = latencyStats(mine);
-      const cap = pool.max_in_flight || 0;
-      const w = cap ? pct(k.inflight || 0, cap) : 0;
+    tb.innerHTML = c.per_key.map((k) => {
+      const cap = c.max_per_key || 0;
+      const w = cap ? pct(k.inflight, cap) : 0;
       const cls = w >= 100 ? 'crit' : (w >= 66 ? 'low' : '');
       return `<tr>
-        <td><div class="name-cell">${esc(k.name)}</div><div class="mask">${esc(k.masked)}</div></td>
-        <td>${stateBadge(k)}</td>
+        <td><div class="name-cell">${esc(k.name)}</div><div class="mask">${esc(k.id)}</div></td>
+        <td>${stateBadge({ state: k.state, enabled: true, cooldown_left: k.cooling_left })}</td>
         <td class="num">
-          <div class="balance-top"><span>${k.inflight || 0}${cap ? ' / ' + cap : ''}</span></div>
+          <div class="balance-top"><span>${k.inflight}${cap ? ' / ' + cap : ''}</span></div>
           <div class="bar"><span class="${cls}" style="width:${w.toFixed(1)}%"></span></div>
         </td>
-        <td class="num">${k.sessions || 0}</td>
-        <td class="num">${compact(k.requests || 0)}</td>
+        <td class="num">${k.sessions}</td>
+        <td class="num">${compact(k.requests)}</td>
         <td class="num">${k.errors > 0 ? '<span style="color:var(--danger)">' + k.errors + '</span>' : '0'}</td>
-        <td class="num">${s.p50 ? s.p50 + 'ms' : '—'}</td>
-        <td class="num">${k.cooldown_left > 0 ? fmtDur(k.cooldown_left) : '—'}</td>
+        <td class="num">${k.p50_ms ? k.p50_ms + 'ms' : '—'}</td>
+        <td class="num">${k.cooling_left > 0 ? fmtDur(k.cooling_left) : '—'}</td>
         <td class="muted">${k.last_ok_at ? mmddhhmm(k.last_ok_at) : '—'}</td>
       </tr>`;
     }).join('');
   }
-  $('capHint').textContent = `延迟样本来自最近 ${st.n} 次成功请求`;
+  $('capHint').textContent = `观测 ${c.observed_rpm} RPM · 成功率 ${(c.success_rate * 100).toFixed(1)}% · 延迟样本 ${c.samples}`;
 }
 
 // ---------- 渲染：模型与档位 ----------
 
 function renderModels() {
   const d = state.data;
+  const mh = d.model_health || [];
+  $('modelHealth').innerHTML = mh.length ? mh.map((h) => `
+    <div class="feed-row">
+      <span class="name"><code>${esc(h.model)}</code></span>
+      <span class="val">${h.keys} 个号 · ${h.kind === 'denied' ? '未开通' : '限流'} · ${h.earliest_left ? fmtDur(h.earliest_left) + ' 后恢复' : '—'}</span>
+    </div>`).join('') : '<div class="empty">当前没有模型级封禁（MODEL_ACCESS_DENIED 只封号 × 模型，不罚整个号）。</div>';
   const list = (d.prices && d.prices.list) || [];
   const q = ($('modelSearch').value || '').trim().toLowerCase();
   const rows = list.filter((p) => !q || p.id.toLowerCase().includes(q));
@@ -556,6 +566,8 @@ function renderConfig() {
     ['自动探活', d.auto_probe ? `${d.auto_probe.enabled ? '开' : '关'} · 每 ${fmtDur(parseDur(d.auto_probe.interval))}` : '—'],
     ['日志环', d.logging ? `${d.logging.ring_size} 条${d.logging.log_bodies ? ' · 记 body' : ''}` : '—'],
     ['价目表', `${(d.prices && d.prices.count) || 0} 个 · ${mmddhhmm(d.prices && d.prices.updated_at)}`],
+    ['请求归档', d.archive && d.archive.enabled ? `开 · 保留 ${d.archive.retain_days} 天 / ${d.archive.max_mb}MB` : '关'],
+    ['会话粘性', `${(d.sessions && d.sessions.active) || 0} 条 · 命中 ${(d.sessions && d.sessions.hits) || 0} / 未命中 ${(d.sessions && d.sessions.misses) || 0}`],
   ];
   $('runtimeKv').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('');
 
@@ -599,8 +611,18 @@ $('poolForm').addEventListener('input', () => {
 
 async function loadLogs() {
   try {
-    const r = await api('/panel/api/logs?n=400');
+    const f = state.filters;
+    let url = '/panel/api/logs?n=400';
+    if (state.history) {
+      url += '&history=1';
+      if (f.status !== 'all') url += '&status=' + encodeURIComponent(f.status);
+      if (f.key !== 'all') url += '&key=' + encodeURIComponent(f.key);
+      if (f.model !== 'all') url += '&model=' + encodeURIComponent(f.model);
+      if (f.text) url += '&text=' + encodeURIComponent(f.text);
+    }
+    const r = await api(url);
     state.logs = r.logs || [];
+    state.logsSource = r.source || 'ring';
     state.logsFetchedAt = Date.now();
     if (state.view === 'logs') renderLogsTable();
   } catch (err) {
@@ -649,7 +671,8 @@ function syncLogFilters() {
 function renderLogsTable() {
   const logs = state.logs;
   syncLogFilters();
-  const rows = logs.filter(logMatches);
+  // 归档是服务端过滤，客户端不再过滤一遍（否则 status/key 条件会被二次应用成空集）
+  const rows = state.history ? logs : logs.filter(logMatches);
   const tb = $('logTable').querySelector('tbody');
   if (!rows.length) {
     tb.innerHTML = `<tr><td colspan="10"><div class="empty">${logs.length ? '没有匹配的请求' : '还没有请求。把客户端的 base_url 指到本网关试试。'}</div></td></tr>`;
@@ -658,7 +681,7 @@ function renderLogsTable() {
       const ok = l.status > 0 && l.status < 400;
       const note = l.error ? l.error : (l.attempt > 1 ? `第 ${l.attempt} 次尝试成功` : '');
       return `<tr>
-        <td class="muted mono">${mmddhhmm(l.time)}</td>
+        <td class="muted mono" title="${esc(l.request_id || '')}">${mmddhhmm(l.time)}</td>
         <td>${esc(l.key_name || '—')}</td>
         <td><code>${esc(l.model || '—')}</code></td>
         <td class="${ok ? 'ok' : 'bad'}">${l.status || '—'}</td>
@@ -675,8 +698,9 @@ function renderLogsTable() {
   // 当成"刚刚发生的"来读时间线。
   const startedAt = new Date(Date.now() - (state.data.uptime_seconds || 0) * 1000);
   const ringSize = (state.data.logging && state.data.logging.ring_size) || '—';
+  const src = state.history ? '归档（跨重启）' : `环形缓冲上限 ${ringSize}`;
   $('logHint').textContent =
-    `最近 ${logs.length} 条 · 匹配 ${rows.length} 条 · 环形缓冲上限 ${ringSize} · 本进程启动于 ${mmddhhmm(startedAt.toISOString())}`;
+    `最近 ${logs.length} 条 · 匹配 ${rows.length} 条 · ${src} · 本进程启动于 ${mmddhhmm(startedAt.toISOString())}`;
 }
 
 $('logTable').addEventListener('click', (e) => {
@@ -688,6 +712,13 @@ $('fStatus').addEventListener('change', () => { state.filters.status = $('fStatu
 $('fKey').addEventListener('change', () => { state.filters.key = $('fKey').value; renderLogsTable(); });
 $('fModel').addEventListener('change', () => { state.filters.model = $('fModel').value; renderLogsTable(); });
 $('fText').addEventListener('input', () => { state.filters.text = $('fText').value.trim(); renderLogsTable(); });
+
+$('btnHistory').addEventListener('click', () => {
+  state.history = !state.history;
+  $('btnHistory').classList.toggle('on', state.history);
+  $('btnHistory').textContent = state.history ? '实时日志' : '历史归档';
+  loadLogs();
+});
 
 // ---------- 操作 ----------
 

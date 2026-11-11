@@ -2,35 +2,58 @@
   "listen": ":8787",
   "upstream": "https://tokenrhythm.studio",
   "data_dir": "./data",
+
   "admin_key": "",
   "client_keys": [],
   "allow_upstream_key_passthrough": false,
+
+  "server": {
+    "read_timeout": "300s",
+    "body_limit_mb": 64,
+    "stream_keepalive": "15s",
+    "shutdown_timeout": "10s"
+  },
+
   "pool": {
     "strategy": "weighted_random",
     "top_k": 5,
     "max_in_flight": 3,
     "max_in_flight_global": 0,
+
     "breaker_threshold": 3,
     "breaker_cooldown": "30s",
     "breaker_cooldown_max": "5m",
+
     "rate_cooldown": "20s",
     "rate_cooldown_max": "10m",
     "exhausted_cooldown": "30m",
+
+    "model_block_base": "6h",
+    "model_block_max": "24h",
+    "model_rate_cooldown": "30s",
+
     "credit_floor": 0.5,
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 4,
+
     "retry_max": 3,
     "upstream_timeout": "300s",
     "video_timeout": "600s",
     "sticky_ttl": "72h",
+
     "least_inflight": true,
     "inflight_penalty": 3,
+    "min_pick_gap": "100ms",
+    "fallback_probe": true,
+    "key_qps": 2,
+
     "session_sticky": {
       "enabled": true,
       "ttl": "30m",
       "max_entries": 2000,
       "prefix_affinity": true
     },
+
     "batch": {
       "mode": "auto",
       "size": 3,
@@ -38,6 +61,7 @@
       "max": 0,
       "target_inflight_per_key": 4
     },
+
     "warmup": {
       "enabled": true,
       "on_start": true,
@@ -45,12 +69,24 @@
       "concurrency": 4
     }
   },
+
   "logging": {
     "ring_size": 400,
-    "log_bodies": false
+    "log_bodies": false,
+    "request_archive": true,
+    "archive_dir": "",
+    "retention_days": 7,
+    "request_archive_max_mb": 100
   },
+
   "auto_probe": {
     "enabled": true,
-    "interval": "2m"
+    "interval": "2m",
+    "timeout": "15s",
+    "concurrency": 4
+  },
+
+  "prices": {
+    "refresh_interval": "10m"
   }
 }

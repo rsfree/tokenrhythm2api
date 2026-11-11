@@ -1,580 +1,504 @@
 package pool
 
 import (
-	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"trpool/internal/config"
+	"trpool/internal/fault"
+	"trpool/internal/session"
 )
 
-func testCfg() config.PoolConfig {
-	return config.PoolConfig{
-		Strategy:          "weighted_random",
-		TopK:              5,
-		MaxInFlight:       4,
-		BreakerThreshold:  3,
-		BreakerCooldown:   config.Duration(30 * time.Second),
-		BreakerMax:        config.Duration(5 * time.Minute),
-		RateCooldown:      config.Duration(20 * time.Second),
-		RateMax:           config.Duration(10 * time.Minute),
-		ExhaustedCooldown: config.Duration(30 * time.Minute),
-		CreditFloor:       0.5,
-		IdleWeightPerHour: 0.5,
-		IdleWeightMax:     4,
-		RetryMax:          3,
-		StickyTTL:         config.Duration(72 * time.Hour),
+func testPool(t *testing.T, tune func(*config.PoolConfig)) *Pool {
+	t.Helper()
+	cfg := config.Default().Pool
+	cfg.MinPickGap = 0
+	cfg.MaxInFlight = 0
+	cfg.CreditFloor = 0
+	cfg.FallbackProbe = false
+	cfg.Batch.Mode = "off"
+	if tune != nil {
+		tune(&cfg)
 	}
+	return New(cfg, session.New(cfg.SessionSticky.TTL.Duration(), cfg.SessionSticky.MaxEntries))
 }
 
-func mustAdd(t *testing.T, p *Pool, name, secret string, budget float64) *Key {
+func addKey(t *testing.T, p *Pool, name string, budget float64) *Key {
 	t.Helper()
-	k, err := p.Add(name, secret, 1, budget)
+	k, err := p.Add(name, "sk_tr_"+name+"_0123456789", 1, budget)
 	if err != nil {
-		t.Fatalf("Add(%s): %v", name, err)
+		t.Fatalf("add %s: %v", name, err)
 	}
 	return k
 }
 
-func TestAddRejectsDuplicateSecret(t *testing.T) {
-	p := New(testCfg())
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	if _, err := p.Add("b", "sk_tr_aaaa", 1, 0); err == nil {
-		t.Fatal("同一密钥重复入池应被拒绝")
+func acquire(t *testing.T, p *Pool, req PickRequest) *Lease {
+	t.Helper()
+	l, err := p.Acquire(req)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
+	return l
 }
 
-func TestAddRejectsBadShape(t *testing.T) {
-	p := New(testCfg())
-	if _, err := p.Add("x", "not-a-key", 1, 0); err == nil {
+func TestAddRejectsDuplicateSecret(t *testing.T) {
+	p := testPool(t, nil)
+	addKey(t, p, "a", 0)
+	if _, err := p.Add("b", "sk_tr_a_0123456789", 1, 0); err == nil {
+		t.Fatal("同一密钥应被拒绝")
+	}
+	if _, err := p.Add("c", "bad-prefix", 1, 0); err == nil {
 		t.Fatal("形态不对的密钥应被拒绝")
 	}
 }
 
-// 429 必须让号进入冷却且不再被选中，冷却到期后 Tick 要能自动拉回。
-func TestRateLimitCoolsThenRecovers(t *testing.T) {
-	cfg := testCfg()
-	p := New(cfg)
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-
-	lease, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatalf("首次选号失败: %v", err)
-	}
-	kind := FailRate
-	p.Release(lease, &kind, "429")
-
-	if st := p.keys[k.ID].State; st != StateCooling {
-		t.Fatalf("429 后状态 = %s，期望 cooling", st)
-	}
+func TestAcquireEmptyPool(t *testing.T) {
+	p := testPool(t, nil)
 	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
-		t.Fatal("冷却中的号不应被选中")
-	}
-
-	// 把冷却时间拨到过去，Tick 应恢复
-	p.mu.Lock()
-	p.keys[k.ID].CooldownUntil = time.Now().Add(-time.Second)
-	p.mu.Unlock()
-	p.Tick()
-	if st := p.keys[k.ID].State; st != StateActive {
-		t.Fatalf("Tick 后状态 = %s，期望 active", st)
+		t.Fatal("空池应报错")
 	}
 }
 
-// 401 是账号级死亡，必须立刻摘掉，且不会被 Tick 复活。
-func TestUnauthorizedMarksInvalid(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
+// 选不到号时的错误信息必须点名成因：401 失效和 429 冷却的处置完全相反，
+// 只说一句"全部在途已满"会把人带到错误的方向。
+func TestNoCapacityReasonIsSpecific(t *testing.T) {
+	p := testPool(t, nil)
+	a := addKey(t, p, "a", 0)
+	p.MarkFail(a.ID, Outcome{Kind: fault.Auth, Model: "m", Message: "UNAUTHORIZED"})
 
-	lease, _ := p.Acquire(PickRequest{Model: "m"})
-	kind := FailAuth
-	p.Release(lease, &kind, "401")
-
-	if p.keys[k.ID].State != StateInvalid {
-		t.Fatalf("状态 = %s，期望 invalid", p.keys[k.ID].State)
+	_, err := p.Acquire(PickRequest{Model: "m"})
+	if err == nil {
+		t.Fatal("唯一号失效后应选不到号")
 	}
-	p.Tick()
-	if p.keys[k.ID].State != StateInvalid {
-		t.Fatal("invalid 不应被 Tick 自动恢复")
+	if msg := err.Error(); !strings.Contains(msg, "失效(401)") {
+		t.Fatalf("错误信息应点明 401 失效，实际 %q", msg)
 	}
-	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
-		t.Fatal("失效号不应被选中")
+
+	b := addKey(t, p, "b", 0)
+	p.MarkFail(b.ID, Outcome{Kind: fault.Rate, Model: "m", Message: "RATE_LIMITED", RetryAfter: 30 * time.Second})
+	_, err = p.Acquire(PickRequest{Model: "m"})
+	if err == nil {
+		t.Fatal("两个号都不可用时应选不到号")
 	}
-}
-
-// 4xx 是请求本身的问题，不能记账到号上——否则一个坏请求会锁死整个池子。
-func TestClientErrorDoesNotCoolKey(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-
-	lease, _ := p.Acquire(PickRequest{Model: "m"})
-	kind := FailClient
-	p.Release(lease, &kind, "403 灰度")
-
-	if p.keys[k.ID].State != StateActive {
-		t.Fatalf("4xx 后状态 = %s，期望仍为 active", p.keys[k.ID].State)
+	msg := err.Error()
+	if !strings.Contains(msg, "冷却中") || !strings.Contains(msg, "失效(401)") {
+		t.Fatalf("应同时点明冷却与失效，实际 %q", msg)
 	}
-	if p.keys[k.ID].FailStreak != 0 {
-		t.Fatal("4xx 不该累计失败次数")
+	if !strings.Contains(msg, "最早") {
+		t.Fatalf("有冷却时应给出恢复时刻，实际 %q", msg)
 	}
 }
 
-// 余额保底：触底的号不接收费模型，但免费模型仍可派。
-func TestCreditFloorSkipsPaidModel(t *testing.T) {
-	cfg := testCfg()
-	p := New(cfg)
-	k := mustAdd(t, p, "poor", "sk_tr_aaaa", 1.0)
-	p.Record(k.ID, 0, 0, 0.9) // 余额剩 0.1 < floor 0.5
+func TestSessionSticky(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.SessionSticky.Enabled = true
+		c.SessionSticky.TTL = config.Duration(time.Hour)
+	})
+	addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
 
-	if _, err := p.Acquire(PickRequest{Model: "paid-model", Paid: true}); err == nil {
-		t.Fatal("余额触底的号不应接收费模型")
-	}
-	if _, err := p.Acquire(PickRequest{Model: "free-model"}); err != nil {
-		t.Fatalf("免费模型应仍可派号: %v", err)
-	}
-}
-
-// 粘性命中：视频查询必须回到创建任务的号，即使它正在冷却。
-func TestStickyWinsEvenWhenCooling(t *testing.T) {
-	p := New(testCfg())
-	a := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	b := mustAdd(t, p, "b", "sk_tr_bbbb", 0)
-
-	p.SetSticky("task-1", a.ID)
-	// 把 a 打进冷却
-	lease, _ := p.Acquire(PickRequest{Model: "m", StickyKeyID: a.ID})
-	kind := FailRate
-	p.Release(lease, &kind, "429")
-
-	got, err := p.Acquire(PickRequest{Model: "m", StickyKeyID: p.StickyKey("task-1")})
-	if err != nil {
-		t.Fatalf("粘性选号失败: %v", err)
-	}
-	if got.KeyID != a.ID {
-		t.Fatalf("粘性指向 %s，实际选中 %s（b=%s）", a.ID, got.KeyID, b.ID)
-	}
-}
-
-func TestInflightCap(t *testing.T) {
-	cfg := testCfg()
-	cfg.MaxInFlight = 1
-	p := New(cfg)
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-
-	l1, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
-		t.Fatal("在途已满时不应再派号")
-	}
-	p.Release(l1, nil, "")
-	if _, err := p.Acquire(PickRequest{Model: "m"}); err != nil {
-		t.Fatalf("释放后应能继续派号: %v", err)
-	}
-}
-
-// 加权随机应该把请求摊开，而不是永远压同一个号。
-func TestWeightedRandomSpreads(t *testing.T) {
-	p := New(testCfg())
-	ids := []string{}
-	for i := 0; i < 3; i++ {
-		k := mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0)
-		ids = append(ids, k.ID)
-	}
-	counts := map[string]int{}
-	for i := 0; i < 600; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m"})
-		if err != nil {
-			t.Fatal(err)
+	var first string
+	for i := 0; i < 6; i++ {
+		l := acquire(t, p, PickRequest{Model: "m", SessionKey: 42})
+		if i == 0 {
+			first = l.KeyID
 		}
-		counts[l.KeyID]++
-		p.Release(l, nil, "")
+		if l.KeyID != first {
+			t.Fatalf("同一会话应粘在同一号上：第 %d 次到了 %s，首轮 %s", i, l.KeyID, first)
+		}
+		p.ReleaseSuccess(l)
 	}
-	for _, id := range ids {
-		if counts[id] < 60 {
-			t.Fatalf("号 %s 只被选中 %d 次，分布过于集中: %v", id, counts[id], counts)
+}
+
+func TestSessionDroppedWhenKeyCooling(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.SessionSticky.Enabled = true
+		c.SessionSticky.TTL = config.Duration(time.Hour)
+	})
+	a := addKey(t, p, "a", 0)
+
+	l := acquire(t, p, PickRequest{Model: "m", SessionKey: 7})
+	if l.KeyID != a.ID {
+		t.Fatalf("只有一个号，应选中 a，实际 %s", l.KeyID)
+	}
+	p.Release(l, Outcome{Kind: fault.Rate, Message: "429", RetryAfter: time.Minute})
+
+	b := addKey(t, p, "b", 0)
+	next := acquire(t, p, PickRequest{Model: "m", SessionKey: 7})
+	if next.KeyID == a.ID {
+		t.Fatal("会话绑定的号在冷却，应重新分配")
+	}
+	if next.KeyID != b.ID {
+		t.Fatalf("应重新绑到 b，实际 %s", next.KeyID)
+	}
+	p.ReleaseSuccess(next)
+}
+
+func TestModelDeniedOnlyBlocksThatModel(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.ModelBlockBase = config.Duration(6 * time.Hour)
+	})
+	a := addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+
+	l := acquire(t, p, PickRequest{Model: "glm-5.1", PreferKeyID: a.ID})
+	if l.KeyID != a.ID {
+		t.Fatalf("软偏好应选中 a，实际 %s", l.KeyID)
+	}
+	p.Release(l, Outcome{Kind: fault.ModelDenied, Model: "glm-5.1", Message: "MODEL_ACCESS_DENIED"})
+
+	for _, v := range p.Views() {
+		if v.ID != a.ID {
+			continue
+		}
+		if v.State != "active" {
+			t.Fatalf("模型未开通不该罚整个号，state=%s", v.State)
+		}
+		if len(v.ModelBlocks) != 1 || v.ModelBlocks[0].Model != "glm-5.1" {
+			t.Fatalf("应只有 glm-5.1 被封，实际 %+v", v.ModelBlocks)
 		}
 	}
+
+	// 同模型换到另一个号。
+	next := acquire(t, p, PickRequest{Model: "glm-5.1"})
+	if next.KeyID == a.ID {
+		t.Fatal("被封的号不该再接同一模型")
+	}
+	p.ReleaseSuccess(next)
+
+	// 别的模型仍可用原号：软偏好指向 a 应该能成。
+	other := acquire(t, p, PickRequest{Model: "kimi-k2", PreferKeyID: a.ID})
+	if other.KeyID != a.ID {
+		t.Fatalf("换模型应回到原号，实际 %s", other.KeyID)
+	}
+	p.ReleaseSuccess(other)
 }
 
-func TestNoKeyWhenEmpty(t *testing.T) {
-	p := New(testCfg())
+func TestModelDeniedBackoffGrows(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.ModelBlockBase = config.Duration(time.Hour)
+		c.ModelBlockMax = config.Duration(10 * time.Hour)
+	})
+	a := addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+
+	l := acquire(t, p, PickRequest{Model: "m", PreferKeyID: a.ID})
+	p.Release(l, Outcome{Kind: fault.ModelDenied, Model: "m"})
+	first := a.ModelBlocks["m"].Until
+
+	// 同号同模型再撞一次（探活/并发路径用 MarkFail）。
+	p.MarkFail(a.ID, Outcome{Kind: fault.ModelDenied, Model: "m", Message: "MODEL_ACCESS_DENIED"})
+	second := a.ModelBlocks["m"].Until
+	if !second.After(first) {
+		t.Fatalf("第二次封禁应更长：first=%s second=%s", first, second)
+	}
+
+	// 封禁期间同模型只能走 b。
+	next := acquire(t, p, PickRequest{Model: "m"})
+	if next.KeyID == a.ID {
+		t.Fatal("模型封禁期间不该再选中")
+	}
+	p.ReleaseSuccess(next)
+}
+
+func TestRateCooldownDoesNotExtend(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.RateCooldown = config.Duration(5 * time.Second)
+		c.RateMax = config.Duration(time.Minute)
+	})
+	k := addKey(t, p, "a", 0)
+
+	p.MarkFail(k.ID, Outcome{Kind: fault.Rate, Message: "RATE_LIMITED"})
+	first := k.CooldownUntil
+	p.MarkFail(k.ID, Outcome{Kind: fault.Rate, Message: "RATE_LIMITED"})
+	if !k.CooldownUntil.Equal(first) {
+		t.Fatalf("冷却中再次 429 不应延长冷却：%s → %s", first, k.CooldownUntil)
+	}
+}
+
+func TestRateCooldownUsesRetryAfter(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.RateCooldown = config.Duration(time.Second)
+		c.RateMax = config.Duration(time.Minute)
+	})
+	k := addKey(t, p, "a", 0)
+	l := acquire(t, p, PickRequest{Model: "m"})
+	p.Release(l, Outcome{Kind: fault.Rate, Message: "RATE_LIMITED", RetryAfter: 12 * time.Second})
+
+	left := time.Until(k.CooldownUntil)
+	if left < 10*time.Second || left > 13*time.Second {
+		t.Fatalf("应按上游 retryAfter 冷却（≈12s），实际 %s", left)
+	}
+}
+
+func TestRateCooldownCap(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.RateCooldown = config.Duration(time.Second)
+		c.RateMax = config.Duration(30 * time.Second)
+	})
+	k := addKey(t, p, "a", 0)
+	l := acquire(t, p, PickRequest{Model: "m"})
+	p.Release(l, Outcome{Kind: fault.Rate, RetryAfter: time.Hour})
+	if left := time.Until(k.CooldownUntil); left > 31*time.Second {
+		t.Fatalf("冷却应被封顶到 30s，实际 %s", left)
+	}
+}
+
+func TestBreakerThreshold(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.BreakerThreshold = 2
+		c.BreakerCooldown = config.Duration(10 * time.Second)
+		c.BreakerMax = config.Duration(time.Minute)
+	})
+	k := addKey(t, p, "a", 0)
+
+	p.Release(acquire(t, p, PickRequest{Model: "m"}), Outcome{Kind: fault.Upstream, Message: "500"})
+	if !k.BreakerUntil.IsZero() {
+		t.Fatal("第一次 5xx 不该熔断")
+	}
+	p.Release(acquire(t, p, PickRequest{Model: "m"}), Outcome{Kind: fault.Upstream, Message: "500"})
+	if k.BreakerUntil.IsZero() {
+		t.Fatal("达到阈值应熔断")
+	}
 	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
-		t.Fatal("空池应返回错误")
+		t.Fatal("熔断期间不该有可用号")
 	}
 }
 
-func TestStickyGC(t *testing.T) {
-	cfg := testCfg()
-	cfg.StickyTTL = config.Duration(10 * time.Millisecond)
-	p := New(cfg)
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	p.SetSticky("t1", k.ID)
-	time.Sleep(15 * time.Millisecond)
-	p.Tick()
-	if got := p.StickyKey("t1"); got != "" {
-		t.Fatalf("过期粘性应被清理，实际仍指向 %s", got)
+func TestAuthAndQuotaStates(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.ExhaustedCooldown = config.Duration(time.Minute) })
+	a := addKey(t, p, "a", 0)
+	b := addKey(t, p, "b", 0)
+
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: a.ID}), Outcome{Kind: fault.Auth, Message: "401"})
+	invalid, exhausted := 0, 0
+	for _, v := range p.Views() {
+		switch v.State {
+		case "invalid":
+			invalid++
+		case "exhausted":
+			exhausted++
+		}
+	}
+	if invalid != 1 {
+		t.Fatalf("应有一个号进 invalid，实际 %d", invalid)
+	}
+	p.Release(acquire(t, p, PickRequest{Model: "m", PreferKeyID: b.ID}), Outcome{Kind: fault.Quota, Message: "402"})
+	for _, v := range p.Views() {
+		if v.State == "exhausted" {
+			exhausted++
+		}
+	}
+	if exhausted != 1 {
+		t.Fatalf("应有一个号进 exhausted，实际 %d", exhausted)
+	}
+
+	for _, id := range []string{a.ID, b.ID} {
+		p.Reset(id)
+	}
+	if total, healthy, _, _, _, _ := p.Counts(); total != 2 || healthy != 2 {
+		t.Fatalf("重置后应全部健康，实际 total=%d healthy=%d", total, healthy)
 	}
 }
 
-func TestSnapshotRestore(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 10)
-	p.Record(k.ID, 100, 50, 1.25)
+func TestCreditFloorBlocksPaidOnly(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.CreditFloor = 1 })
+	k := addKey(t, p, "a", 10)
+	p.Record(k.ID, 0, 0, 9.5) // 余额 0.5 < 1
+
+	if _, err := p.Acquire(PickRequest{Model: "paid", Paid: true}); err == nil {
+		t.Fatal("余额触底不该再接收费模型")
+	}
+	l, err := p.Acquire(PickRequest{Model: "free", Paid: false})
+	if err != nil {
+		t.Fatalf("免费模型应放行: %v", err)
+	}
+	p.ReleaseSuccess(l)
+}
+
+func TestUnknownBudgetNotStarved(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.CreditFloor = 5
+		c.TopK = 2
+	})
+	addKey(t, p, "known", 0)
+	fresh := addKey(t, p, "fresh", 0)
+	hits := 0
+	for i := 0; i < 200; i++ {
+		l := acquire(t, p, PickRequest{Model: "paid", Paid: true})
+		if l.KeyID == fresh.ID {
+			hits++
+		}
+		p.ReleaseSuccess(l)
+	}
+	if hits == 0 {
+		t.Fatal("充值额未知的号被打成 0 权重，永远抽不中")
+	}
+}
+
+func TestInflightLimit(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.MaxInFlight = 1 })
+	addKey(t, p, "a", 0)
+
+	l := acquire(t, p, PickRequest{Model: "m"})
+	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
+		t.Fatal("单号在途已满，不该再派")
+	}
+	p.ReleaseSuccess(l)
+	l2 := acquire(t, p, PickRequest{Model: "m"})
+	p.ReleaseSuccess(l2)
+}
+
+func TestDoubleReleaseDoesNotLeak(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.MaxInFlight = 1 })
+	addKey(t, p, "a", 0)
+	l := acquire(t, p, PickRequest{Model: "m"})
+	p.ReleaseSuccess(l)
+	p.ReleaseSuccess(l)
+	if st := p.BatchState(); st.TotalInflight != 0 {
+		t.Fatalf("在途计数泄漏: %d", st.TotalInflight)
+	}
+	l2 := acquire(t, p, PickRequest{Model: "m"})
+	p.ReleaseSuccess(l2)
+}
+
+func TestStickyTaskReturnsCoolingKey(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.ExhaustedCooldown = config.Duration(time.Minute) })
+	a := addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+	a.State = StateExhausted
+	a.CooldownUntil = time.Now().Add(time.Minute)
+
+	l := acquire(t, p, PickRequest{Model: "m", StickyKeyID: a.ID})
+	if l.KeyID != a.ID {
+		t.Fatalf("视频查询必须回创建者 %s，实际 %s", a.ID, l.KeyID)
+	}
+	p.ReleaseSuccess(l)
+}
+
+func TestFallbackPicksEarliestExpiry(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.FallbackProbe = true })
+	a := addKey(t, p, "a", 0)
+	b := addKey(t, p, "b", 0)
+	a.State, b.State = StateCooling, StateCooling
+	a.CooldownUntil = time.Now().Add(30 * time.Second)
+	b.CooldownUntil = time.Now().Add(10 * time.Second)
+
+	l := acquire(t, p, PickRequest{Model: "m"})
+	if l.KeyID != b.ID || !l.Fallback {
+		t.Fatalf("应兜底到最早恢复的号 %s（fallback），实际 %s fallback=%v", b.ID, l.KeyID, l.Fallback)
+	}
+	p.ReleaseSuccess(l)
+}
+
+func TestFallbackSkipsExhaustedAndInvalid(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.FallbackProbe = true })
+	a := addKey(t, p, "a", 0)
+	b := addKey(t, p, "b", 0)
+	a.State = StateExhausted
+	a.CooldownUntil = time.Now().Add(time.Minute)
+	b.State = StateInvalid
+	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
+		t.Fatal("exhausted/invalid 号不该参与兜底")
+	}
+}
+
+func TestAllKeysModelBlockedExplains(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) { c.FallbackProbe = false })
+	addKey(t, p, "a", 0)
+	addKey(t, p, "b", 0)
+	for i := 0; i < 2; i++ {
+		l := acquire(t, p, PickRequest{Model: "m"})
+		p.Release(l, Outcome{Kind: fault.ModelDenied, Model: "m", Message: "MODEL_ACCESS_DENIED"})
+	}
+	if _, err := p.Acquire(PickRequest{Model: "m"}); err == nil {
+		t.Fatal("全池模型封禁后应失败")
+	} else if !strings.Contains(err.Error(), "封禁") {
+		t.Fatalf("错误信息应说明是模型封禁，实际: %s", err.Error())
+	}
+}
+
+func TestBatchAutoGrowsWithInflight(t *testing.T) {
+	p := testPool(t, func(c *config.PoolConfig) {
+		c.MaxInFlight = 10
+		c.Batch.Mode = "auto"
+		c.Batch.Min = 1
+		c.Batch.TargetInflightPerKey = 2
+	})
+	for i := 0; i < 5; i++ {
+		addKey(t, p, string(rune('a'+i)), 0)
+	}
+	var leases []*Lease
+	for i := 0; i < 4; i++ {
+		leases = append(leases, acquire(t, p, PickRequest{Model: "m"}))
+	}
+	st := p.BatchState()
+	if st.Size == 0 || st.Target == 0 {
+		t.Fatalf("batch 应有成员与目标: %+v", st)
+	}
+	if st.Target != 2 {
+		t.Fatalf("4 在途 / 每号 2 → target 应为 2，实际 %+v", st)
+	}
+	for _, l := range leases {
+		p.ReleaseSuccess(l)
+	}
+}
+
+func TestSnapshotRoundTrip(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 12.5)
+	k.Weight = 2
+	p.SetSticky("task-1", k.ID)
+	l := acquire(t, p, PickRequest{Model: "m"})
+	p.Release(l, Outcome{Kind: fault.ModelDenied, Model: "m", Message: "denied"})
+	p.Record(k.ID, 10, 20, 0.01)
 
 	snap := p.Snapshot()
-	p2 := New(testCfg())
-	p2.Restore(snap)
+	q := testPool(t, nil)
+	q.Restore(snap)
 
-	views := p2.Views()
+	views := q.Views()
 	if len(views) != 1 {
-		t.Fatalf("恢复后应只有 1 个号，实际 %d", len(views))
+		t.Fatalf("恢复后应有 1 个号，实际 %d", len(views))
 	}
 	v := views[0]
-	if v.Spent != 1.25 || v.PromptTokens != 100 || v.CompletionTokens != 50 {
-		t.Fatalf("记账未正确恢复: %+v", v)
+	if v.ID != k.ID || v.Name != "a" || v.Budget != 12.5 || v.Weight != 2 {
+		t.Fatalf("恢复字段不一致: %+v", v)
 	}
-	if v.Balance != 8.75 {
-		t.Fatalf("余额 = %v，期望 8.75", v.Balance)
+	if v.PromptTokens != 10 || v.CompletionTokens != 20 {
+		t.Fatalf("用量没恢复: %+v", v)
 	}
-}
-
-// ---------- 会话粘性 ----------
-
-func stickyCfg() config.PoolConfig {
-	c := testCfg()
-	c.SessionSticky = config.SessionSticky{
-		Enabled:        true,
-		TTL:            config.Duration(time.Minute),
-		MaxEntries:     100,
-		PrefixAffinity: true,
+	if len(v.ModelBlocks) != 1 {
+		t.Fatalf("模型封禁没恢复: %+v", v.ModelBlocks)
 	}
-	return c
-}
-
-// 同一会话必须一直落在同一个号上——这是命中上游 prompt cache 的前提。
-func TestSessionStickyHitsSameKey(t *testing.T) {
-	p := New(stickyCfg())
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	mustAdd(t, p, "b", "sk_tr_bbbb", 0)
-	mustAdd(t, p, "c", "sk_tr_cccc", 0)
-
-	const sess = uint64(0xdeadbeef)
-	first, err := p.Acquire(PickRequest{Model: "m", SessionKey: sess})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.Release(first, nil, "")
-
-	for i := 0; i < 12; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m", SessionKey: sess})
-		if err != nil {
-			t.Fatalf("第 %d 次: %v", i, err)
-		}
-		if l.KeyID != first.KeyID {
-			t.Fatalf("会话被拆散了：首次 %s，第 %d 次 %s", first.KeyID, i, l.KeyID)
-		}
-		p.Release(l, nil, "")
+	if got := q.StickyKey("task-1"); got != k.ID {
+		t.Fatalf("粘性任务没恢复: %s", got)
 	}
 }
 
-// 不同会话应该能落在不同号上，否则"粘性"就成了"只用第一个号"。
-func TestSessionStickySeparatesConversations(t *testing.T) {
-	p := New(stickyCfg())
-	for i := 0; i < 4; i++ {
-		mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0)
-	}
-	seen := map[string]bool{}
-	for s := uint64(1); s <= 24; s++ {
-		l, err := p.Acquire(PickRequest{Model: "m", SessionKey: s * 7919})
-		if err != nil {
-			t.Fatal(err)
-		}
-		seen[l.KeyID] = true
-		p.Release(l, nil, "")
-	}
-	if len(seen) < 2 {
-		t.Fatalf("24 个不同会话只用了 %d 个号，粘性表把流量焊死在一个号上了", len(seen))
+func TestTickRevivesCooling(t *testing.T) {
+	p := testPool(t, nil)
+	k := addKey(t, p, "a", 0)
+	k.State = StateCooling
+	k.CooldownUntil = time.Now().Add(-time.Second)
+	p.Tick()
+	if k.State != StateActive {
+		t.Fatalf("到期冷却应复活，实际 %s", k.State)
 	}
 }
 
-// 粘住的号出事（冷却）时必须退让，不能让会话卡死。
-func TestSessionStickyFallsBackWhenKeyCooling(t *testing.T) {
-	p := New(stickyCfg())
-	a := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	mustAdd(t, p, "b", "sk_tr_bbbb", 0)
-
-	const sess = uint64(42)
-	l1, _ := p.Acquire(PickRequest{Model: "m", SessionKey: sess})
-	p.Release(l1, nil, "")
-
-	// 把 a 打进冷却
-	p.mu.Lock()
-	p.keys[a.ID].State = StateCooling
-	p.keys[a.ID].CooldownUntil = time.Now().Add(time.Minute)
-	p.mu.Unlock()
-
-	l2, err := p.Acquire(PickRequest{Model: "m", SessionKey: sess})
-	if err != nil {
-		t.Fatalf("粘性号冷却后应能换号: %v", err)
-	}
-	if l2.KeyID == a.ID {
-		t.Fatal("冷却中的号不该被粘性选中")
-	}
-	p.Release(l2, nil, "")
-}
-
-// 关掉粘性后，同一会话应该会被摊开（证明开关真的起作用）。
-func TestSessionStickyDisabledSpreads(t *testing.T) {
-	cfg := stickyCfg()
-	cfg.SessionSticky.Enabled = false
-	p := New(cfg)
-	for i := 0; i < 3; i++ {
-		mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0)
-	}
-	seen := map[string]bool{}
-	const sess = uint64(99)
-	for i := 0; i < 60; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m", SessionKey: sess})
-		if err != nil {
-			t.Fatal(err)
-		}
-		seen[l.KeyID] = true
-		p.Release(l, nil, "")
-	}
-	if len(seen) < 2 {
-		t.Fatal("粘性关闭后仍在粘同一个号，开关没生效")
-	}
-}
-
-// ---------- batch ----------
-
-// fixed 模式下只允许动用指定数量的号。
-func TestBatchFixedLimitsActiveKeys(t *testing.T) {
-	cfg := testCfg()
-	cfg.Batch = config.Batch{Mode: "fixed", Size: 1, Min: 1}
-	p := New(cfg)
-	for i := 0; i < 4; i++ {
-		mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0)
-	}
-	used := map[string]bool{}
-	for i := 0; i < 30; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		used[l.KeyID] = true
-		p.Release(l, nil, "")
-	}
-	if len(used) != 1 {
-		t.Fatalf("batch=1 应用只动用 1 个号，实际用了 %d 个", len(used))
-	}
-}
-
-// batch 成员失效后要自动补齐，否则可用号会越用越少。
-func TestBatchRefillsAfterMemberCooling(t *testing.T) {
-	cfg := testCfg()
-	cfg.Batch = config.Batch{Mode: "fixed", Size: 2, Min: 1}
-	p := New(cfg)
-	var keys []*Key
-	for i := 0; i < 4; i++ {
-		keys = append(keys, mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0))
-	}
-	// 先让 batch 成型
-	for i := 0; i < 6; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.Release(l, nil, "")
-	}
-	if st := p.BatchState(); st.Size != 2 {
-		t.Fatalf("batch 大小 = %d，期望 2", st.Size)
-	}
-
-	// 把当前 batch 里的第一个号打废
-	p.mu.Lock()
-	victim := p.batch[0]
-	p.keys[victim].State = StateInvalid
-	p.mu.Unlock()
-
-	for i := 0; i < 6; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m"})
-		if err != nil {
-			t.Fatalf("补齐失败: %v", err)
-		}
-		if l.KeyID == victim {
-			t.Fatal("失效号仍在被派单")
-		}
-		p.Release(l, nil, "")
-	}
-	st := p.BatchState()
-	if st.Size != 2 {
-		t.Fatalf("失效后 batch 未补齐，大小 = %d", st.Size)
-	}
-	for _, id := range st.Members {
-		if id == victim {
-			t.Fatal("失效号仍留在 batch 里")
+func TestModelHealthAggregates(t *testing.T) {
+	p := testPool(t, nil)
+	a := addKey(t, p, "a", 0)
+	b := addKey(t, p, "b", 0)
+	for _, k := range []*Key{a, b} {
+		k.ModelBlocks = map[string]ModelBlock{
+			"m": {Model: "m", Until: time.Now().Add(time.Hour), Kind: "denied"},
 		}
 	}
-	_ = keys
-}
-
-// auto 模式下，在途越高 batch 越大（单号跑满就扩）。
-func TestBatchAutoExpandsUnderInflight(t *testing.T) {
-	cfg := testCfg()
-	cfg.MaxInFlight = 1 // 逼出"一个号只能扛一个请求"
-	cfg.Batch = config.Batch{Mode: "auto", Min: 1, Max: 3, TargetInflightPerKey: 1}
-	p := New(cfg)
-	for i := 0; i < 3; i++ {
-		mustAdd(t, p, fmt.Sprintf("k%d", i), fmt.Sprintf("sk_tr_%04d", i), 0)
+	list := p.ModelHealth()
+	if len(list) != 1 || list[0].Keys != 2 || list[0].Model != "m" {
+		t.Fatalf("模型健康聚合不对: %+v", list)
 	}
-
-	var leases []*Lease
-	for i := 0; i < 3; i++ {
-		l, err := p.Acquire(PickRequest{Model: "m"})
-		if err != nil {
-			t.Fatalf("第 %d 个并发请求选号失败: %v", i+1, err)
-		}
-		leases = append(leases, l)
-	}
-	distinct := map[string]bool{}
-	for _, l := range leases {
-		distinct[l.KeyID] = true
-	}
-	if len(distinct) != 3 {
-		t.Fatalf("3 个并发应摊到 3 个号，实际 %d 个", len(distinct))
-	}
-	for _, l := range leases {
-		p.Release(l, nil, "")
-	}
-}
-
-// ---------- 在途优先 ----------
-
-func TestLeastInflightPrefersIdleKey(t *testing.T) {
-	cfg := testCfg()
-	cfg.Strategy = "sequential" // 走确定性的 leastInflight 分支
-	cfg.LeastInflight = true
-	cfg.MaxInFlight = 10
-	p := New(cfg)
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	mustAdd(t, p, "b", "sk_tr_bbbb", 0)
-
-	l1, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// l1 占住一个号后，下一个必须给空闲的那个
-	l2, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l2.KeyID == l1.KeyID {
-		t.Fatal("并发下仍压同一个号，在途感知没生效")
-	}
-	p.Release(l1, nil, "")
-	p.Release(l2, nil, "")
-}
-
-func TestBatchStateReportsInflight(t *testing.T) {
-	cfg := testCfg()
-	cfg.Batch = config.Batch{Mode: "fixed", Size: 2, Min: 1}
-	p := New(cfg)
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	l, _ := p.Acquire(PickRequest{Model: "m"})
-	st := p.BatchState()
-	if st.TotalInflight != 1 {
-		t.Fatalf("在途 = %d，期望 1", st.TotalInflight)
-	}
-	p.Release(l, nil, "")
-	if p.BatchState().TotalInflight != 0 {
-		t.Fatal("释放后在途应归零")
-	}
-}
-
-// 429 带了 retryAfter 就按它冷却：不套默认 20s，也不乘 2^n。
-func TestRateLimitHonorsRetryAfter(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-
-	l, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatalf("选号失败: %v", err)
-	}
-	kind := FailRate
-	p.ReleaseWithHint(l, &kind, "429 RATE_LIMITED", 15*time.Second)
-
-	if st := p.keys[k.ID].State; st != StateCooling {
-		t.Fatalf("状态 = %s，期望 cooling", st)
-	}
-	if d := time.Until(p.keys[k.ID].CooldownUntil); d < 13*time.Second || d > 17*time.Second {
-		t.Fatalf("冷却 = %v，期望约 15s（按 retryAfter 原值，不再指数放大）", d)
-	}
-}
-
-// 同一种 429 重复十次也不该把冷却放大——retryAfter 是权威值。
-func TestRateLimitDoesNotEscalateWithHint(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	kind := FailRate
-	for i := 0; i < 10; i++ {
-		p.MarkFail(k.ID, kind, "429 RATE_LIMITED")
-		p.Reset(k.ID)
-	}
-	l, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatalf("选号失败: %v", err)
-	}
-	p.ReleaseWithHint(l, &kind, "429 RATE_LIMITED", 15*time.Second)
-	if d := time.Until(p.keys[k.ID].CooldownUntil); d > 20*time.Second {
-		t.Fatalf("冷却 = %v，带提示时不该被历史失败次数放大", d)
-	}
-}
-
-// 模型侧限流不是号的错：状态必须留在 active，且还能被选到。
-func TestUpstreamRateDoesNotPunishKey(t *testing.T) {
-	p := New(testCfg())
-	k := mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-
-	l, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatalf("选号失败: %v", err)
-	}
-	kind := FailUpstreamRate
-	p.ReleaseWithHint(l, &kind, "429 UPSTREAM_RATE_LIMITED", 3*time.Second)
-
-	if st := p.keys[k.ID].State; st != StateActive {
-		t.Fatalf("状态 = %s，期望 active（不罚号）", st)
-	}
-	if k.FailStreak != 0 {
-		t.Errorf("FailStreak = %d，期望 0", k.FailStreak)
-	}
-	if _, err := p.Acquire(PickRequest{Model: "m"}); err != nil {
-		t.Fatalf("号应仍可被选中: %v", err)
-	}
-}
-
-// PreferKeyID 只是软偏好：目标号在冷却时不能被强行放行。
-func TestPreferKeyIDFallsBackWhenCooling(t *testing.T) {
-	p := New(testCfg())
-	mustAdd(t, p, "a", "sk_tr_aaaa", 0)
-	mustAdd(t, p, "b", "sk_tr_bbbb", 0)
-
-	l, err := p.Acquire(PickRequest{Model: "m"})
-	if err != nil {
-		t.Fatalf("选号失败: %v", err)
-	}
-	kind := FailRate
-	p.ReleaseWithHint(l, &kind, "429", 30*time.Second)
-
-	lease, err := p.Acquire(PickRequest{Model: "m", PreferKeyID: l.KeyID})
-	if err != nil {
-		t.Fatalf("应回落到其它号: %v", err)
-	}
-	if lease.KeyID == l.KeyID {
-		t.Fatalf("冷却中的号不该被偏好放行")
-	}
-	p.Release(lease, nil, "")
 }

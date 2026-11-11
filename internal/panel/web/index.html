@@ -218,6 +218,11 @@
         <!-- ========== 模型与档位 ========== -->
         <section class="view" data-view="models" hidden>
           <section class="panel">
+            <div class="panel-head"><h2>模型级封禁</h2><span class="muted">只封「号 × 模型」，不牵连同号其它模型</span></div>
+            <div class="feed" id="modelHealth"></div>
+          </section>
+
+          <section class="panel">
             <div class="panel-head">
               <h2>价目表</h2>
               <div class="panel-actions">
@@ -293,7 +298,8 @@
                 <select id="fStatus"><option value="all">全部状态</option><option value="bad">仅失败</option><option value="ok">仅成功</option></select>
                 <select id="fKey"><option value="all">全部号</option></select>
                 <select id="fModel"><option value="all">全部模型</option></select>
-                <input id="fText" class="search" placeholder="搜索 trace / 备注…" autocomplete="off">
+                <input id="fText" class="search" placeholder="搜索 request id / trace / 备注…" autocomplete="off">
+                <button class="btn ghost small" id="btnHistory" title="查询 JSONL 归档（跨重启、跨天）">历史归档</button>
               </div>
             </div>
             <p class="hint" id="logHint">—</p>

@@ -1,5 +1,8 @@
-// Package upstream 是到 tokenrhythm 的传输层：只负责"把请求原样送过去、把响应原样拿回来"，
-// 不含任何选号/重试逻辑（那是 proxy 的职责）。
+// Package upstream 是到 tokenrhythm 的传输层：只负责"把请求原样送过去、把响应原样
+// 拿回来"，不含任何选号/重试/记账逻辑（那是 server 与 pool 的职责）。
+//
+// tokenrhythm 本身就是 OpenAI/Anthropic 兼容的纯 API，没有鉴权握手、没有设备码、
+// 没有客户端指纹，所以这一层比 workbuddy2api 薄得多：一个 Transport 加一次 Do。
 package upstream
 
 import (
@@ -27,13 +30,14 @@ var hopHeaders = map[string]bool{
 }
 
 type Client struct {
-	base      string
-	chat      *http.Client
-	video     *http.Client
-	userAgent string
+	base string
+	hc   *http.Client
+	ua   string
 }
 
-func New(base string, chatTimeout, videoTimeout time.Duration) *Client {
+// New 构建传输层。超时由调用方用 context 控制（对话/视频预算不同），
+// 所以 http.Client 自身不设 Timeout——否则视频任务会被对话超时误杀。
+func New(base string) *Client {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -41,7 +45,7 @@ func New(base string, chatTimeout, videoTimeout time.Duration) *Client {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          200,
+		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
@@ -50,10 +54,9 @@ func New(base string, chatTimeout, videoTimeout time.Duration) *Client {
 		DisableCompression: true,
 	}
 	return &Client{
-		base:      strings.TrimRight(base, "/"),
-		chat:      &http.Client{Transport: tr, Timeout: chatTimeout},
-		video:     &http.Client{Transport: tr, Timeout: videoTimeout},
-		userAgent: "trpool/1.0",
+		base: strings.TrimRight(base, "/"),
+		hc:   &http.Client{Transport: tr},
+		ua:   "trpool/2 (+https://github.com/rsfree/tokenrhythm2api)",
 	}
 }
 
@@ -76,24 +79,20 @@ func (r *Result) Close() {
 }
 
 // Do 发出一次上游请求。stream=true 且上游返回 2xx 时不读 body，直接交回连接。
-func (c *Client) Do(ctx context.Context, method, path string, body []byte, secret string, hdr http.Header, stream, isVideo bool) (*Result, error) {
-	url := c.base + path
+func (c *Client) Do(ctx context.Context, method, path string, body []byte, secret string, hdr http.Header, stream bool) (*Result, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
 	if err != nil {
 		return nil, err
 	}
 	// 复制客户端头，剔除逐跳头与鉴权头（鉴权由池子接管）。
 	for k, vs := range hdr {
 		lk := strings.ToLower(k)
-		if hopHeaders[lk] || lk == "authorization" || lk == "host" || lk == "content-length" {
-			continue
-		}
-		// 交给 Go 的 Transport 自己协商压缩，否则记账要解 gzip。
-		if lk == "accept-encoding" {
+		if hopHeaders[lk] || lk == "authorization" || lk == "host" ||
+			lk == "content-length" || lk == "accept-encoding" {
 			continue
 		}
 		for _, v := range vs {
@@ -101,7 +100,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 		}
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", c.ua)
 	if body != nil && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -109,11 +108,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 		req.Header.Set("Accept", "text/event-stream")
 	}
 
-	hc := c.chat
-	if isVideo {
-		hc = c.video
-	}
-	resp, err := hc.Do(req)
+	resp, err := c.hc.Do(req)
 	if err != nil {
 		return nil, classifyNetErr(err)
 	}
@@ -121,10 +116,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 	res := &Result{
 		Status:  resp.StatusCode,
 		Header:  resp.Header.Clone(),
-		TraceID: resp.Header.Get("x-trace-id"),
-	}
-	if res.TraceID == "" {
-		// 有些错误把 traceId 放在 body 里，读的时候再补。
+		TraceID: firstHeader(resp.Header, "x-trace-id", "x-request-id", "request-id"),
 	}
 
 	if stream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -144,20 +136,10 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 	return res, nil
 }
 
-// StatusError 是上游返回非 2xx 时的结构化错误。
-// 调用方（预热、探活）需要按状态码决定怎么处理这个号，不能只看一句字符串。
-type StatusError struct {
-	Status int
-	Body   []byte
-}
-
-func (e *StatusError) Error() string {
-	return fmt.Sprintf("上游返回 %d: %s", e.Status, snippet(e.Body))
-}
-
-// FetchModels 用某个号拉一次价目表。
+// FetchModels 用某个号拉一次 /v1/models（价目表 + 探活共用）。
+// 只读，不消耗生成额度。
 func (c *Client) FetchModels(ctx context.Context, secret string) ([]byte, error) {
-	res, err := c.Do(ctx, http.MethodGet, "/v1/models", nil, secret, http.Header{}, false, false)
+	res, err := c.Do(ctx, http.MethodGet, "/v1/models", nil, secret, http.Header{}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +149,29 @@ func (c *Client) FetchModels(ctx context.Context, secret string) ([]byte, error)
 	return res.Body, nil
 }
 
+// StatusError 是上游返回非 2xx 时的结构化错误。
+// 调用方（预热、探活）需要按状态码决定怎么处理这个号，不能只看一句字符串。
+type StatusError struct {
+	Status int
+	Body   []byte
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("上游返回 %d: %s", e.Status, snippet(e.Body, 240))
+}
+
+func firstHeader(h http.Header, names ...string) string {
+	for _, n := range names {
+		if v := strings.TrimSpace(h.Get(n)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func classifyNetErr(err error) error {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("上游超时: %w", err)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("上游超时或被取消: %w", err)
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
@@ -178,11 +180,11 @@ func classifyNetErr(err error) error {
 	return fmt.Errorf("连接上游失败: %w", err)
 }
 
-func snippet(b []byte) string {
-	if len(b) > 300 {
-		return string(b[:300]) + "…"
+func snippet(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
 	}
-	return string(b)
+	return string(b[:n]) + "…"
 }
 
 func traceFromBody(b []byte) string {
@@ -192,7 +194,6 @@ func traceFromBody(b []byte) string {
 		return ""
 	}
 	rest := b[i+len(k):]
-	// 跳过 : " 与空白
 	j := 0
 	for j < len(rest) && (rest[j] == ':' || rest[j] == ' ' || rest[j] == '"') {
 		j++
