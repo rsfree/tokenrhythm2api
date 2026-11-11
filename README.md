@@ -510,8 +510,10 @@ curl -X POST "https://trpool.1task.cn/panel/api/keys/batch" \
 curl -X POST "https://trpool.1task.cn/panel/api/keys/prune" \
   -H "Authorization: Bearer $TRPOOL_ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"dry_run":true}'
-# → {"ok":true,"dry_run":true,"matched":20,"removed":0,"states":["exhausted","blocked","disabled"],
-#    "names":["tr-1","tr-2",...]}
+# 2026-11-11 真实抓包（当时池内 22 个号：20 欠费 + 1 冻结 + 1 可用）：
+# {"ok":true,"dry_run":true,"matched":21,"removed":0,
+#  "states":["exhausted","blocked","disabled"],
+#  "names":["账号C","tr-1","tr-2","tr-3",...]}
 ```
 
 `states` 留空即默认 `["exhausted","blocked","disabled"]`（也就是面板上的"停用号"）。
