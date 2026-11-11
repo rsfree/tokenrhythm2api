@@ -202,6 +202,8 @@
               <li>上游限的是<strong>次数窗口</strong>，不是并发数：实测每号 <code>30 次 / 约 15 秒</code> ≈ 2 QPS，超了返 429 <code>RATE_LIMITED</code> + <code>retryAfterSeconds</code>。</li>
               <li>安全在飞 ≈ <code>2 QPS × 平均耗时</code>。按当前 p95 延迟算，单号同时压 <strong id="cSafePerKey">—</strong> 个请求是稳态上限；配的 <code>max_in_flight</code> 超过它只会把 429 打出来。</li>
               <li>batch 的 <code>target_inflight_per_key</code> 决定「几个号一起扛」：并发 ÷ 该值向上取整，夹在 min/max 之间。号少时它退化成全压一个号 —— 这时候瓶颈是<strong>窗口次数</strong>，不是并发。</li>
+              <li>号多的池子（几十上百个）用 <code>fixed</code>：只让 N 个号参与派单，某个号 401/402/把钱跑空就<strong>当场补一个</strong>进来，窗口不会掉到 N-1。剩下的号是备胎，不白白摊薄余额。</li>
+              <li>开了弹性扩容后，按号限流的 429 占比超过触发线就多开几个号（一个统计窗口最多扩一次），连续稳定一段时间再逐个退回 N。<strong>模型侧限流不计入</strong>——那是全池共享的上游瓶颈，多开号加不了配额。</li>
             </ul>
           </section>
 
@@ -269,11 +271,23 @@
                 <select id="pSticky"><option value="1">开启（保 prompt cache）</option><option value="0">关闭（纯分摊）</option></select>
               </label>
               <label>粘性 TTL（分钟）<input type="number" id="pStickyTtl" min="1"></label>
-              <label>Batch 模式
-                <select id="pBatchMode"><option value="off">off · 全池平分</option><option value="auto">auto · 按并发放大</option><option value="fixed">fixed · 固定个数</option></select>
+              <label>活跃窗口（号）
+                <select id="pBatchMode">
+                  <option value="off">off · 全池平分</option>
+                  <option value="auto">auto · 按并发伸缩</option>
+                  <option value="fixed">fixed · 固定窗口，死一个补一个</option>
+                </select>
               </label>
-              <label>Batch 固定个数<input type="number" id="pBatchSize" min="1"></label>
+              <label>窗口大小（号）<input type="number" id="pBatchSize" min="1"></label>
               <label>每号承载在途<input type="number" id="pBatchPer" min="1"></label>
+              <label>弹性扩容
+                <select id="pElastic"><option value="1">开 · 429 变多自动加号</option><option value="0">关 · 恒为窗口大小</option></select>
+              </label>
+              <label>弹性上限（号）<input type="number" id="pElasticMax" min="0" placeholder="0 = 跟随池大小"></label>
+              <label>扩容步长<input type="number" id="pElasticStep" min="1"></label>
+              <label>429 触发线（%）<input type="number" id="pElasticRate" min="1" max="100" step="1"></label>
+              <label>统计窗口（秒）<input type="number" id="pElasticWindow" min="5"></label>
+              <label>稳定回退（分钟）<input type="number" id="pElasticStable" min="1"></label>
             </div>
             <p class="hint">保存会立即热更新调度器，并写回 <code>config.json</code> 的 <code>pool</code> 段（密钥永不落盘）。</p>
           </section>

@@ -180,6 +180,32 @@ func TestPanelPoolHotUpdateWritesConfig(t *testing.T) {
 	}
 }
 
+// 只改窗口大小不该把其它参数清零——手写 curl 只传一两个字段太常见了。
+// 以前那版是"解到零值再逐项兜底"，漏兜的字段会被静默清零，
+// 比如 breaker_threshold 变 0 之后熔断就再也不会触发。
+func TestPanelPoolPartialUpdateKeepsOthers(t *testing.T) {
+	h := newPanelHarness(t)
+	before := h.pool.Config()
+	body := `{"strategy":"weighted_random","batch":{"mode":"fixed","size":2}}`
+	resp, out := h.call(t, http.MethodPut, "/panel/api/pool", body, true)
+	if resp.StatusCode != 200 {
+		t.Fatalf("局部热更新失败: %d %s", resp.StatusCode, out)
+	}
+	cur := h.pool.Config()
+	if cur.BreakerThreshold != before.BreakerThreshold {
+		t.Fatalf("breaker_threshold 被清零: %d → %d", before.BreakerThreshold, cur.BreakerThreshold)
+	}
+	if cur.RateMax != before.RateMax || cur.RetryMax != before.RetryMax {
+		t.Fatalf("冷却/重试参数被改掉: %+v", cur)
+	}
+	if cur.Batch.Mode != "fixed" || cur.Batch.Size != 2 {
+		t.Fatalf("窗口参数没生效: %+v", cur.Batch)
+	}
+	if cur.Batch.Elastic.Window.Duration() != 60*time.Second {
+		t.Fatalf("弹性默认值应补齐，实际 %v", cur.Batch.Elastic.Window.Duration())
+	}
+}
+
 func TestPanelRejectsBadStrategy(t *testing.T) {
 	h := newPanelHarness(t)
 	resp, _ := h.call(t, http.MethodPut, "/panel/api/pool", `{"strategy":"magic"}`, true)

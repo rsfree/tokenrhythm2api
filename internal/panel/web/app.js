@@ -310,21 +310,49 @@ function renderAccess(d) {
   if (btn) btn.onclick = () => copyText(keys[0] || '');
 }
 
+// 活跃窗口要一眼看出三件事：现在几个号在派单、目标几个、弹性有没有加号。
+// "12/12 个在用" 和 "目标 12 实际 9" 是两种完全不同的状况（后者是号不够了）。
 function renderBatchKv(d) {
   const b = d.batch || {};
   const p = d.pool || {};
+  const mode = b.mode || (p.batch && p.batch.mode) || 'off';
+  const modeLabel = { off: 'off · 全池平分', fixed: 'fixed · 固定窗口', auto: 'auto · 按并发伸缩' }[mode] || mode;
+  const total = b.pool_size ?? (d.keys || []).length;
+  const target = b.target ?? 0;
+  const size = b.size ?? 0;
+  const extra = b.extra || 0;
+
+  let windowText;
+  if (mode === 'off') {
+    windowText = `全池参与（${total} 个号）`;
+  } else {
+    windowText = `${size} 个在用 / 目标 ${target}`;
+    if (extra > 0) windowText += `（含弹性 +${extra}）`;
+  }
+
+  const ratio = (b.rate_ratio || 0) * 100;
+  const trigger = (b.trigger_rate || 0) * 100;
+  const pressure = b.rate_total
+    ? `${b.rate_hits}/${b.rate_total} = ${ratio.toFixed(1)}% · ${b.window_sec}s 窗口 · 触发线 ${trigger.toFixed(0)}%`
+    : `窗口内没有请求 · 触发线 ${trigger.toFixed(0)}%`;
+  const lastHit = b.last_rate_ago ? ` · 最近 ${fmtDur(b.last_rate_ago)}前` : '';
+
+  const elasticText = b.elastic
+    ? `开 · 上限 ${b.elastic_cap || '—'} 个号${extra > 0 ? ` · 已加 ${extra}` : ''}`
+    : '关 · 恒为窗口大小';
+
   const rows = [
-    ['batch 模式', b.mode || (p.batch && p.batch.mode) || 'off'],
-    ['batch 用量', b.mode === 'off'
-      ? `全池参与（${(d.keys || []).length} 个号）`
-      : `${b.size ?? 0} 个号 / 目标 ${b.target ?? 0}`],
-    ['活跃会话', String(b.sessions ?? 0)],
-    ['在途请求', String(b.total_inflight ?? 0)],
-    ['粘性任务', String(b.sticky_tasks ?? 0)],
+    ['活跃窗口', `${modeLabel} · ${windowText}`],
+    ['池子', `${total} 个号 · 可用 ${b.available ?? 0}${size < target ? ` · 缺 ${target - size} 个` : ''}`],
+    ['429 压力', pressure + lastHit],
+    ['弹性扩容', elasticText],
+    ['运行态', `会话 ${b.sessions ?? 0} · 在途 ${b.total_inflight ?? 0} · 粘性任务 ${b.sticky_tasks ?? 0}`],
     ['策略', `${p.strategy || '—'} · topK ${p.top_k ?? '—'} · 单号上限 ${p.max_in_flight ?? '—'}`],
   ];
   $('batchKv').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
-  $('batchHint').textContent = b.mode === 'off' ? '全池平分' : '按并发放大';
+  $('batchHint').textContent = mode === 'off'
+    ? '全池平分'
+    : mode === 'fixed' ? `窗口 ${target} 个号 · 死一个补一个` : '按并发放大';
 }
 
 function renderErrFeed(d) {
@@ -611,9 +639,16 @@ function fillPoolForm(p) {
   $('pSticky').value = ss.enabled ? '1' : '0';
   $('pStickyTtl').value = Math.max(1, Math.round(parseDur(ss.ttl) / 60) || 30);
   const bt = p.batch || {};
+  const el = bt.elastic || {};
   $('pBatchMode').value = bt.mode || 'auto';
   $('pBatchSize').value = bt.size ?? 3;
   $('pBatchPer').value = bt.target_inflight_per_key ?? 4;
+  $('pElastic').value = el.enabled ? '1' : '0';
+  $('pElasticMax').value = el.max_size ?? 0;
+  $('pElasticStep').value = el.step ?? 2;
+  $('pElasticRate').value = Math.round((el.trigger_rate ?? 0.15) * 100);
+  $('pElasticWindow').value = Math.max(5, Math.round(parseDur(el.window) || 60));
+  $('pElasticStable').value = Math.max(1, Math.round((parseDur(el.stable) || 300) / 60));
 }
 
 // 手动改过表单就别再被 5 秒轮询覆盖回去（否则输入到一半会跳值）
@@ -861,6 +896,16 @@ $('btnSavePool').addEventListener('click', async () => {
       mode: $('pBatchMode').value,
       size: parseInt($('pBatchSize').value, 10) || 3,
       target_inflight_per_key: parseInt($('pBatchPer').value, 10) || 4,
+      elastic: {
+        // hold / decay_step / min_samples / min_hits 不在表单里，靠 spread 保留原值。
+        ...((base.batch || {}).elastic || {}),
+        enabled: $('pElastic').value === '1',
+        max_size: parseInt($('pElasticMax').value, 10) || 0,
+        step: parseInt($('pElasticStep').value, 10) || 2,
+        trigger_rate: Math.min(1, Math.max(0.01, (parseFloat($('pElasticRate').value) || 15) / 100)),
+        window: Math.max(5, parseInt($('pElasticWindow').value, 10) || 60) + 's',
+        stable: Math.max(1, parseInt($('pElasticStable').value, 10) || 5) + 'm',
+      },
     },
   };
   try {

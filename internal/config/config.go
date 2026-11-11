@@ -53,15 +53,88 @@ type SessionSticky struct {
 	PrefixAffinity bool `json:"prefix_affinity"`
 }
 
-// Batch 控制"同时只用几个号"。
-// off=全池参与；fixed=固定 N 个；auto=按在途并发自动伸缩。
+// Batch 控制"同一时刻只用几个号"，也就是活跃窗口。
+//
+// off=全池参与；fixed=固定 N 个（死一个补一个）；auto=按在途并发自动伸缩。
 type Batch struct {
 	Mode string `json:"mode"`
-	Size int    `json:"size"`
-	Min  int    `json:"min"`
-	Max  int    `json:"max"` // 0 = 不限（等于池大小）
+	// Size 是 fixed 的窗口大小 / auto 的下限。池子有 100 个号、Size=12，
+	// 就是"只有 12 个号在派单，其余待命"。
+	Size int `json:"size"`
+	Min  int `json:"min"`
+	Max  int `json:"max"` // 0 = 不限（等于池大小）
 	// auto 的换算基准：每多少在途请求扩一个号
 	TargetInflightPerKey int `json:"target_inflight_per_key"`
+
+	// Elastic 是 429 驱动的弹性扩容：压力上来多开几个号，稳定后回落到 Size。
+	Elastic Elastic `json:"elastic"`
+}
+
+// Elastic 让活跃窗口在 [Size, MaxSize] 之间自动浮动。
+//
+// 只统计"按号限流"的 429（RATE_LIMITED）——那是这个号的次数窗口满了，
+// 多开号确实能加总配额。模型侧限流（UPSTREAM_RATE_LIMITED）是全池共享的
+// 上游瓶颈，开更多号不加吞吐，不计入。
+type Elastic struct {
+	Enabled bool `json:"enabled"`
+	// Window 是统计窗口；也是两次扩容之间的最小间隔（一个窗口最多扩一次）。
+	Window Duration `json:"window"`
+	// TriggerRate 是窗口内 429 占比的触发线（0.15 = 15%）。
+	TriggerRate float64 `json:"trigger_rate"`
+	// MinSamples 是占比生效所需的最小样本数；样本不足时只要窗口内
+	// 出现 MinHits 次 429 也算压力（低流量池子照样能扩）。
+	MinSamples int `json:"min_samples"`
+	MinHits    int `json:"min_hits"`
+	Step       int `json:"step"`
+	// MaxSize 是弹性上限（0 = 用 batch.max，再不行就用池大小）。
+	MaxSize int `json:"max_size"`
+	// Hold 是扩容后至少保持多久才开始考虑缩容。
+	Hold Duration `json:"hold"`
+	// Stable 是连续多久没有 429 才缩容。
+	Stable    Duration `json:"stable"`
+	DecayStep int      `json:"decay_step"`
+}
+
+// Normalize 补齐 Batch 的零值。热更新接口也会调用它：
+// 前端少传一项不应该把窗口大小变成 0。
+func (b *Batch) Normalize() {
+	if b.Min <= 0 {
+		b.Min = 1
+	}
+	if b.Size <= 0 {
+		b.Size = 3
+	}
+	if b.TargetInflightPerKey <= 0 {
+		b.TargetInflightPerKey = 4
+	}
+	e := &b.Elastic
+	if e.Window.Duration() <= 0 {
+		e.Window = Duration(60 * time.Second)
+	}
+	if e.TriggerRate <= 0 || e.TriggerRate > 1 {
+		e.TriggerRate = 0.15
+	}
+	if e.MinSamples <= 0 {
+		e.MinSamples = 20
+	}
+	if e.MinHits <= 0 {
+		e.MinHits = 2
+	}
+	if e.Step <= 0 {
+		e.Step = 2
+	}
+	if e.Hold.Duration() <= 0 {
+		e.Hold = Duration(2 * time.Minute)
+	}
+	if e.Stable.Duration() <= 0 {
+		e.Stable = Duration(5 * time.Minute)
+	}
+	if e.DecayStep <= 0 {
+		e.DecayStep = 1
+	}
+	if e.MaxSize < 0 {
+		e.MaxSize = 0
+	}
 }
 
 // Warmup 启动预热与周期保活。
@@ -409,15 +482,7 @@ func (c *Config) normalize() {
 	default:
 		p.Batch.Mode = "auto"
 	}
-	if p.Batch.Min <= 0 {
-		p.Batch.Min = 1
-	}
-	if p.Batch.Size <= 0 {
-		p.Batch.Size = 3
-	}
-	if p.Batch.TargetInflightPerKey <= 0 {
-		p.Batch.TargetInflightPerKey = 4
-	}
+	p.Batch.Normalize()
 	if p.InflightPenalty <= 0 {
 		p.InflightPenalty = 3
 	}

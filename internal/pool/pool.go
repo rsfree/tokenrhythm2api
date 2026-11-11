@@ -32,6 +32,8 @@ type Pool struct {
 
 	sticky map[string]stickyEntry
 	batch  []string
+	// elastic 是 429 驱动的窗口弹性状态（不落盘）。
+	elastic elasticState
 
 	sessions *session.Table
 	onChange func()
@@ -66,6 +68,15 @@ func (p *Pool) SetConfig(cfg config.PoolConfig) {
 	p.cfg = cfg
 	// 会话粘性参数热更新：表本身跟着换 TTL/上限，不让旧设置继续生效。
 	p.sessions = session.New(cfg.SessionSticky.TTL.Duration(), cfg.SessionSticky.MaxEntries)
+	now := time.Now()
+	if cfg.Batch.Mode == "off" || cfg.Batch.Mode == "" {
+		// 关掉窗口就把成员清掉，别让面板还挂着 B 标。
+		p.batch = nil
+		p.elastic.extra = 0
+	} else {
+		p.evalElasticLocked(now)
+		p.refreshBatchLocked(now)
+	}
 	p.mu.Unlock()
 	p.notify()
 }
@@ -113,6 +124,8 @@ func (p *Pool) Add(name, secret string, weight, budget float64) (*Key, error) {
 	}
 	p.keys[k.ID] = k
 	p.order = append(p.order, k.ID)
+	// 新号入池立刻参与窗口：批量导 100 个号时不用等下一笔请求才补齐。
+	p.refreshBatchLocked(now)
 	p.notify()
 	return k, nil
 }
@@ -163,6 +176,7 @@ func (p *Pool) Update(id string, name, secret *string, weight, budget *float64, 
 			k.State = StateDisabled
 		}
 	}
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 	return nil
 }
@@ -186,6 +200,7 @@ func (p *Pool) Remove(id string) bool {
 		}
 	}
 	p.batch = removeString(p.batch, id)
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 	return true
 }
@@ -209,6 +224,7 @@ func (p *Pool) Reset(id string) bool {
 	if !k.Enabled {
 		k.Enabled = true
 	}
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 	return true
 }
@@ -241,6 +257,7 @@ func (p *Pool) AddBudget(id string, delta float64) bool {
 	if k.Budget < 0 {
 		k.Budget = 0
 	}
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 	return true
 }
@@ -262,6 +279,9 @@ func (p *Pool) Record(id string, promptTok, completionTok int64, costCNY float64
 		// 记账口径穿仓：上游已经不让用了，别等下一笔 402。
 		k.SpentCNY = k.Budget
 	}
+	// 记账刚好把余额跑空时，窗口立刻换人——"没钱了就补一个"靠这里兜住，
+	// 不用等服务端发 402 回来。
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 }
 
@@ -336,6 +356,14 @@ func (p *Pool) Tick() {
 				changed = true
 			}
 		}
+	}
+	// 弹性窗口与活跃窗口都在这里随时间长回来/退回去：
+	// 没有流量的时候没人调 Release，只能靠 5 秒一次的巡检。
+	if p.evalElasticLocked(now) {
+		changed = true
+	}
+	if p.refreshBatchLocked(now) {
+		changed = true
 	}
 	if changed {
 		p.notify()
@@ -539,9 +567,26 @@ func (p *Pool) Views() []View {
 
 // BatchState 是调度面板要看的"当前用了几个号"。
 type BatchState struct {
-	Mode          string   `json:"mode"`
-	Target        int      `json:"target"`
-	Size          int      `json:"size"`
+	Mode string `json:"mode"`
+	// Base 是基准窗口（fixed 的 size / auto 的并发换算值），Target 是含弹性余量的当前目标。
+	Base   int `json:"base"`
+	Target int `json:"target"`
+	Size   int `json:"size"`
+	// Extra 是弹性多开出来的号数；ElasticCap 是弹性上限。
+	Extra      int  `json:"extra"`
+	Elastic    bool `json:"elastic"`
+	ElasticCap int  `json:"elastic_cap"`
+	// PoolSize / Available 让面板能解释"目标 12 实际 11"：可用的号本来就不够。
+	PoolSize  int `json:"pool_size"`
+	Available int `json:"available"`
+	// RateRatio 是统计窗口内的 429 占比，RateHits/RateTotal 是它的分子分母。
+	RateRatio   float64 `json:"rate_ratio"`
+	RateHits    int     `json:"rate_hits"`
+	RateTotal   int     `json:"rate_total"`
+	WindowSec   int     `json:"window_sec"`
+	LastRateAgo int     `json:"last_rate_ago"`
+	// TriggerRate 是配置的扩容触发线，面板要拿它解释"为什么还没扩"。
+	TriggerRate   float64  `json:"trigger_rate"`
 	Members       []string `json:"members"`
 	MemberNames   []string `json:"member_names"`
 	TotalInflight int      `json:"total_inflight"`
@@ -552,9 +597,11 @@ type BatchState struct {
 func (p *Pool) BatchState() BatchState {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	st := BatchState{
 		Mode:          p.cfg.Batch.Mode,
 		Size:          len(p.batch),
+		PoolSize:      len(p.keys),
 		Members:       append([]string(nil), p.batch...),
 		TotalInflight: p.totalInflight,
 		Sessions:      p.sessions.Len(),
@@ -565,9 +612,27 @@ func (p *Pool) BatchState() BatchState {
 			st.MemberNames = append(st.MemberNames, k.Name)
 		}
 	}
+	for _, k := range p.keys {
+		if k.usableForBatch(now, p.cfg.CreditFloor) {
+			st.Available++
+		}
+	}
+	if base, ok := p.batchBase(); ok {
+		st.Base = base
+	}
 	if t, ok := p.batchTarget(); ok {
 		st.Target = t
 	}
+	ev := p.elasticViewLocked(now)
+	st.Elastic = ev.enabled
+	st.Extra = ev.extra
+	st.ElasticCap = ev.cap
+	st.RateRatio = ev.ratio
+	st.RateHits = ev.hits
+	st.RateTotal = ev.total
+	st.WindowSec = ev.window
+	st.LastRateAgo = ev.lastAgo
+	st.TriggerRate = p.cfg.Batch.Elastic.TriggerRate
 	return st
 }
 

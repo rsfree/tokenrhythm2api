@@ -1,10 +1,12 @@
 """本地假上游：只为截图/联调造数据，不参与任何真实调用。
 
-行为按 Authorization 里的假密钥区分：
-  key-one    正常 200
-  key-two    正常 200（延迟更高，制造 p95 差异）
-  key-three  429 RATE_LIMITED + retryAfterSeconds
-  key-four   glm-5.1 上 403 MODEL_ACCESS_DENIED，其它模型 200
+行为按 Authorization 里的假密钥后缀区分：
+  ..._one     正常 200
+  ..._two     正常 200（延迟更高，制造 p95 差异）
+  ..._three   429 RATE_LIMITED + retryAfterSeconds
+  ..._four    glm-5.1 上 403 MODEL_ACCESS_DENIED，其它模型 200
+  ..._rateN   429 按号限流（演示弹性扩窗：这类号越多，429 占比越高）
+  ..._drain   402 额度不足（演示"一个号没钱了，窗口自动补一个"）
 """
 import json
 import random
@@ -66,7 +68,8 @@ class H(BaseHTTPRequestHandler):
         if p == "/v1/models":
             tok = self._auth()
             time.sleep(0.05)
-            if tok.rsplit("_", 1)[-1] == "three":
+            tag = tok.rsplit("_", 1)[-1]
+            if tag == "three" or tag.startswith("rate"):
                 # 429 号连探活都过不去，演示"探活失败不改状态"的保守处理
                 return self._json(429, {"error": {"code": "RATE_LIMITED", "message": "配额已用完"}},
                                   {"Retry-After": "13"})
@@ -106,7 +109,10 @@ class H(BaseHTTPRequestHandler):
         if p not in ("/v1/chat/completions", "/v1/messages"):
             return self._json(404, {"error": {"code": "NOT_FOUND", "message": p}})
 
-        if tag == "three":
+        if tag.startswith("drain"):
+            return self._json(402, {"error": {"code": "INSUFFICIENT_BALANCE",
+                                              "message": "账号额度不足，请充值"}})
+        if tag == "three" or tag.startswith("rate"):
             return self._json(429, {"error": {"code": "RATE_LIMITED",
                                               "message": "该账号本窗口请求数已达上限"}},
                               {"Retry-After": "13"})

@@ -55,6 +55,9 @@ func (p *Pool) Release(l *Lease, o Outcome) {
 		if o.Model != "" {
 			delete(k.ModelBlocks, o.Model)
 		}
+		p.observe(now, false)
+		p.evalElasticLocked(now)
+		p.refreshBatchLocked(now)
 		p.notify()
 		return
 	}
@@ -63,6 +66,11 @@ func (p *Pool) Release(l *Lease, o Outcome) {
 	k.LastError = truncate(o.Message, 240)
 	k.LastErrorAt = now
 	p.applyFailLocked(k, o, now)
+	// 只有"按号限流"算压力：多开号能加总配额。
+	// 模型侧限流是全池共享的上游瓶颈，欠费/失效则应该补号而不是扩窗。
+	p.observe(now, o.Kind == fault.Rate)
+	p.evalElasticLocked(now)
+	p.refreshBatchLocked(now)
 	p.notify()
 }
 
@@ -82,6 +90,9 @@ func (p *Pool) MarkFail(id string, o Outcome) {
 	k.LastError = truncate(o.Message, 240)
 	k.LastErrorAt = time.Now()
 	p.applyFailLocked(k, o, time.Now())
+	// 探活/预热不算业务流量，不进 429 占比的样本；
+	// 但号刚被判定不可用时，窗口要立刻补一个上来。
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 }
 
@@ -102,6 +113,7 @@ func (p *Pool) MarkOK(id string) {
 		k.State = StateActive
 		k.LastError = ""
 	}
+	p.refreshBatchLocked(time.Now())
 	p.notify()
 }
 
@@ -135,6 +147,7 @@ func (p *Pool) ReenableIfCredits(id string) {
 		k.State = StateActive
 		k.CooldownUntil = time.Time{}
 		k.CooldownReason = ""
+		p.refreshBatchLocked(time.Now())
 		p.notify()
 	}
 }

@@ -148,6 +148,22 @@ func (k *Key) usableFor(now time.Time, model string) bool {
 	return true
 }
 
+// usableForBatch 是"够不够格占一个活跃窗口名额"。
+//
+// 比 usable 多看一眼余额：钱跑空的号留在窗口里只是占位——
+// 面板显示 12 个在用，实际只有 11 个能派单。让它把名额让给下一个，
+// 这就是"1 个没钱了自动补 1 个"的判定依据。
+// Budget<=0 表示未填充值额（未知），不参与余额判断。
+func (k *Key) usableForBatch(now time.Time, floor float64) bool {
+	if !k.usable(now) {
+		return false
+	}
+	if k.Budget > 0 && k.Balance() <= floor {
+		return false
+	}
+	return true
+}
+
 // expiry 返回该号最早恢复可用的时刻（冷却/熔断），无视模型级封禁。
 // 零值表示"没有时间型等待"。
 func (k *Key) expiry(now time.Time) time.Time {

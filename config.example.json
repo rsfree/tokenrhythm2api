@@ -55,11 +55,23 @@
     },
 
     "batch": {
-      "mode": "auto",
-      "size": 3,
+      "mode": "fixed",
+      "size": 12,
       "min": 1,
       "max": 0,
-      "target_inflight_per_key": 4
+      "target_inflight_per_key": 4,
+      "elastic": {
+        "enabled": true,
+        "window": "60s",
+        "trigger_rate": 0.15,
+        "min_samples": 20,
+        "min_hits": 2,
+        "step": 2,
+        "max_size": 0,
+        "hold": "2m",
+        "stable": "5m",
+        "decay_step": 1
+      }
     },
 
     "warmup": {

@@ -447,7 +447,13 @@ func (p *Panel) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "方法不支持")
 		return
 	}
-	var in config.PoolConfig
+	// 以当前配置打底再覆盖：请求体里没出现的字段保持原值。
+	//
+	// 不要"解到零值再逐项兜底"——漏兜的字段（比如 breaker_threshold、
+	// idle_weight_per_hour）会被静默清零，而服务看起来还活着：熔断再也不触发、
+	// 闲置补偿悄无声息地关掉。手写 curl 只改一两个字段的场景太常见了。
+	cur := p.d.Pool.Config()
+	in := cur
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
@@ -458,56 +464,15 @@ func (p *Panel) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "strategy 只能是 weighted_random / round_robin / sequential")
 		return
 	}
-	// 未传的字段用当前值兜底，避免前端少传一项就把冷却清零。
-	cur := p.d.Pool.Config()
-	if in.TopK <= 0 {
-		in.TopK = cur.TopK
+	switch in.Batch.Mode {
+	case "off", "auto", "fixed":
+	case "":
+		in.Batch.Mode = cur.Batch.Mode
+	default:
+		writeErr(w, http.StatusBadRequest, "batch.mode 只能是 off / auto / fixed")
+		return
 	}
-	if in.RetryMax <= 0 {
-		in.RetryMax = cur.RetryMax
-	}
-	if in.UpstreamTimeout.Duration() <= 0 {
-		in.UpstreamTimeout = cur.UpstreamTimeout
-	}
-	if in.VideoTimeout.Duration() <= 0 {
-		in.VideoTimeout = cur.VideoTimeout
-	}
-	if in.StickyTTL.Duration() <= 0 {
-		in.StickyTTL = cur.StickyTTL
-	}
-	if in.RateCooldown.Duration() <= 0 {
-		in.RateCooldown = cur.RateCooldown
-	}
-	if in.RateMax.Duration() <= 0 {
-		in.RateMax = cur.RateMax
-	}
-	if in.BreakerCooldown.Duration() <= 0 {
-		in.BreakerCooldown = cur.BreakerCooldown
-	}
-	if in.ExhaustedCooldown.Duration() <= 0 {
-		in.ExhaustedCooldown = cur.ExhaustedCooldown
-	}
-	if in.ModelBlockBase.Duration() <= 0 {
-		in.ModelBlockBase = cur.ModelBlockBase
-	}
-	if in.ModelBlockMax.Duration() <= 0 {
-		in.ModelBlockMax = cur.ModelBlockMax
-	}
-	if in.ModelRateCooldown.Duration() <= 0 {
-		in.ModelRateCooldown = cur.ModelRateCooldown
-	}
-	if in.KeyQPS <= 0 {
-		in.KeyQPS = cur.KeyQPS
-	}
-	if in.SessionSticky.TTL.Duration() <= 0 {
-		in.SessionSticky.TTL = cur.SessionSticky.TTL
-	}
-	if in.SessionSticky.MaxEntries <= 0 {
-		in.SessionSticky.MaxEntries = cur.SessionSticky.MaxEntries
-	}
-	if in.Batch.TargetInflightPerKey <= 0 {
-		in.Batch.TargetInflightPerKey = cur.Batch.TargetInflightPerKey
-	}
+	in.Batch.Normalize()
 
 	p.d.Pool.SetConfig(in)
 	if err := config.WritePool(p.d.ConfigPath, in); err != nil {
