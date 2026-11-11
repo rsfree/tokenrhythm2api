@@ -1,0 +1,18 @@
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"","content":"","role":"assistant"}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"We","content":""}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" need to respond to","content":""}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":" user \"","content":""}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"say ok\".","content":""}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","object":"chat.completion.chunk","created":1794377367,"model":"qwen3.8-flash","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","created":1794377367,"model":"qwen3.8-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}],"usage":null}
+
+data: {"id":"chatcmpl-dc8216d4-064d-9d8c-b25d-76bef5d98e31","object":"chat.completion.chunk","created":1794377367,"model":"qwen3.8-flash","choices":[],"usage":{"completion_tokens":10,"prompt_tokens":63,"total_tokens":73,"completion_tokens_details":{"reasoning_tokens":10,"text_tokens":10},"prompt_tokens_details":{"cached_tokens":0,"text_tokens":63}},"cost_cny":"0.00007740","billing_pending":false,"trace_id":"trace_da9745c4-2ab6-4128-8e6f-b25c39e3d291","reasoning_available":true}
+
+data: [DONE]
+

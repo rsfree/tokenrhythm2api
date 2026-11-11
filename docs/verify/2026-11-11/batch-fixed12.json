@@ -1,0 +1,32 @@
+{
+ "mode": "fixed",
+ "base": 12,
+ "target": 12,
+ "size": 4,
+ "extra": 0,
+ "elastic": true,
+ "elastic_cap": 12,
+ "pool_size": 23,
+ "available": 4,
+ "rate_ratio": 0,
+ "rate_hits": 0,
+ "rate_total": 21,
+ "window_sec": 60,
+ "last_rate_ago": 93,
+ "trigger_rate": 0.15,
+ "members": [
+  "k002q68a",
+  "k003l40p",
+  "k003n8an",
+  "k001ctqa"
+ ],
+ "member_names": [
+  "账号B",
+  "账号C",
+  "tr-3",
+  "账号A"
+ ],
+ "total_inflight": 0,
+ "sessions": 0,
+ "sticky_tasks": 0
+}
