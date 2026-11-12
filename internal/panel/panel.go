@@ -126,6 +126,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		"ok":             true,
 		"version":        p.d.Version,
 		"upstream":       p.d.Up.Base(),
+		"upstream_ua":    p.d.Up.UA(),
 		"listen":         p.d.Cfg.Listen,
 		"data_dir":       p.d.Cfg.DataDir,
 		"auto_probe":     probeCfg,

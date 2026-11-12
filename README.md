@@ -180,6 +180,21 @@ print(client.chat.completions.create(
 - 超过 32MB 的体、以及 `Content-Type` 不是 JSON 的，不重新序列化，避免无谓开销。
 - 面板与 `data/requests/*.jsonl` **保留原文**——运营侧要能用这些字段排障。
 
+### 出站请求：不带网关自己的身份
+
+反方向同样要收：**不能把"我是一池子号"写在请求里发给上游**。
+
+| 出站头 | 处理 | 为什么 |
+|---|---|---|
+| `User-Agent` | 默认**透传客户端 UA**；客户端没带（探活/预热/刷价目表）才用内置 SDK 形态兜底 | 老实现写死 `trpool/2 (+github 仓库地址)`：同一出口 IP 上 20 个号全用这一个字符串，等于自报号池 |
+| `X-Forwarded-For` / `X-Real-IP` / `Forwarded` / `CF-Connecting-IP` / `True-Client-IP` 等 | 全部剥掉 | 那是终端用户的 IP。上游本来不该知道"这个号的请求来自哪些 IP"，而一批号轮流带着同一拨客户端 IP，恰好证明这些号被同一个人攥着 |
+| `Via` / `X-Via` / `X-Proxy-Id` | 剥掉 | 代理链痕迹 |
+| `Origin` / `Referer` / `Cookie` | 剥掉 | 写的是**网关自己**的域名与面板会话，转上去等于把中转站地址报给上游 |
+| `OpenAI-Beta` / `Anthropic-Version` / `X-Request-Id` / `Idempotency-Key` | 照常转发 | 正常 API 调用的组成部分，剥了反而更像异常流量 |
+
+需要固定 UA（上游按 UA 做准入时）就配 `upstream_user_agent` 或 `TRPOOL_UPSTREAM_UA`，
+但别填 `trpool/xxx` 这种可识别的字符串。面板「配置」页会显示当前策略。
+
 ---
 
 ## 调度
@@ -602,6 +617,7 @@ GET    /panel/api/config                        # 运行时信息
 | `TRPOOL_LISTEN` | 监听地址，默认 `:8787` |
 | `TRPOOL_DATA_DIR` | 数据目录，默认 `./data` |
 | `TRPOOL_BODY_LIMIT_MB` | 请求体上限，默认 64 |
+| `TRPOOL_UPSTREAM_UA` | 出站 User-Agent，空（默认）= 透传客户端 UA |
 | `TRPOOL_KEYS` | 首启灌号：`名称=密钥=充值额,...`（池子非空时忽略） |
 
 ### 主要参数

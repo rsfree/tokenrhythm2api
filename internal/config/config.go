@@ -277,6 +277,12 @@ type Config struct {
 	AdminKey   string   `json:"admin_key"`
 	ClientKeys []string `json:"client_keys"`
 
+	// UpstreamUA 是出站 User-Agent。留空（推荐）= 透传客户端自己的 UA，
+	// 客户端没带才用内置的 SDK 形态兜底；填了就所有出站请求统一用它。
+	// 不建议写"trpool/xxx"这类自报家门的字符串——同一出口 IP 上的号全用同一个
+	// 可识别 UA，是上游判断号池最省事的线索。
+	UpstreamUA string `json:"upstream_user_agent"`
+
 	// 是否允许客户端自带的 sk_tr_ 直接透传（不安全，默认关）
 	AllowUpstreamKeyPassthrough bool `json:"allow_upstream_key_passthrough"`
 
@@ -400,6 +406,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("TRPOOL_DATA_DIR"); v != "" {
 		c.DataDir = v
 	}
+	if v := os.Getenv("TRPOOL_UPSTREAM_UA"); v != "" {
+		c.UpstreamUA = v
+	}
 	if v := os.Getenv("TRPOOL_BODY_LIMIT_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Server.BodyLimitMB = n
@@ -428,6 +437,9 @@ func (c *Config) normalize() {
 	if c.Listen == "" {
 		c.Listen = ":8787"
 	}
+	// UA 是要直接塞进 HTTP 头的，先洗掉控制字符（配置文件里手写 \n 会让
+	// http.Client 报 "invalid header field value"，那种错在运行期才炸、很难定位）。
+	c.UpstreamUA = sanitizeHeaderValue(c.UpstreamUA)
 	if c.Server.BodyLimitMB <= 0 {
 		c.Server.BodyLimitMB = 64
 	}
@@ -533,6 +545,27 @@ func (c *Config) normalize() {
 	if c.Prices.RefreshInterval.Duration() <= 0 {
 		c.Prices.RefreshInterval = Duration(10 * time.Minute)
 	}
+}
+
+// sanitizeHeaderValue 把任意字符串洗成能安全塞进 HTTP 头的值：
+// 去掉控制字符、折叠空白、限长 200 字节。
+func sanitizeHeaderValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out
 }
 
 // Validate 只拦"启动就会炸"的问题。

@@ -30,15 +30,59 @@ var hopHeaders = map[string]bool{
 	"upgrade":             true,
 }
 
+// inboundOnlyHeaders 是"只属于客户端到网关这一段"的头，一律不往上游送。
+//
+// 两类东西：
+//   - 网络身份：X-Forwarded-For / X-Real-IP / Forwarded / CF-Connecting-IP… 记的是
+//     终端用户（或我们前面那层反代）的 IP。上游本来不该知道"这个 sk_tr_ 账号的
+//     请求来自哪些 IP"，而一堆号轮流携带同一批客户端 IP，恰好是"这些号被同一个人
+//     攥在手里"的最直白证据。
+//   - 入口身份：Origin / Referer / Cookie 里写的是**网关自己**的域名与面板会话。
+//     原样转上去等于把中转站的地址主动报给上游。
+var inboundOnlyHeaders = map[string]bool{
+	"x-forwarded-for": true, "x-forwarded-host": true, "x-forwarded-proto": true,
+	"x-forwarded-port": true, "x-forwarded-server": true, "forwarded": true,
+	"x-real-ip": true, "client-ip": true, "x-client-ip": true,
+	"x-originating-ip": true, "x-remote-ip": true, "x-remote-addr": true,
+	"true-client-ip": true, "cf-connecting-ip": true, "cf-ipcountry": true,
+	"fastly-client-ip": true, "x-cluster-client-ip": true, "x-proxyuser-ip": true,
+
+	"via": true, "x-via": true, "x-proxy-id": true, "proxy-connection": true,
+
+	"origin": true, "referer": true, "cookie": true,
+}
+
+const (
+	// defaultUA 是"客户端没带 UA"时的兜底，例如面板探活、启动预热、价目表刷新。
+	//
+	// 老实现把自己的身份写死在 UA 里（trpool/2 + GitHub 仓库地址）：同一出口 IP 上
+	// 20 个号全用这一个字符串，等于举着"我是号池"的牌子。用官方 SDK 的常见形态
+	// 兜底，没有额外信息量——上游看到的就是一次普通的 SDK 调用。
+	defaultUA = "OpenAI/Python 1.55.3"
+
+	// uaPassthrough 是 c.ua 的空值语义：透传客户端 UA。
+	uaPassthrough = ""
+)
+
 type Client struct {
 	base string
 	hc   *http.Client
-	ua   string
+	// ua 为空 = 透传客户端 UA（客户端也没带才用 defaultUA）；
+	// 非空 = 所有出站请求强制用这个值（上游挑 UA 时才需要）。
+	ua string
+}
+
+// Option 是 New 的可选项。
+type Option func(*Client)
+
+// WithUserAgent 覆盖出站 User-Agent。传空字符串 = 透传客户端 UA。
+func WithUserAgent(ua string) Option {
+	return func(c *Client) { c.ua = strings.TrimSpace(ua) }
 }
 
 // New 构建传输层。超时由调用方用 context 控制（对话/视频预算不同），
 // 所以 http.Client 自身不设 Timeout——否则视频任务会被对话超时误杀。
-func New(base string) *Client {
+func New(base string, opts ...Option) *Client {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -54,14 +98,32 @@ func New(base string) *Client {
 		// 关掉自动压缩：我们自己管，避免透传 gzip 后记账读不到明文。
 		DisableCompression: true,
 	}
-	return &Client{
+	c := &Client{
 		base: strings.TrimRight(base, "/"),
 		hc:   &http.Client{Transport: tr},
-		ua:   "trpool/2 (+https://github.com/rsfree/tokenrhythm2api)",
+		ua:   uaPassthrough,
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 func (c *Client) Base() string { return c.base }
+
+// UA 返回当前的 UA 策略（空字符串表示透传客户端 UA），供面板展示。
+func (c *Client) UA() string { return c.ua }
+
+// pickUA 决定这次出站用哪个 User-Agent（见 Client.ua 的注释）。
+func (c *Client) pickUA(in http.Header) string {
+	if c.ua != "" {
+		return c.ua
+	}
+	if ua := strings.TrimSpace(in.Get("User-Agent")); ua != "" {
+		return ua
+	}
+	return defaultUA
+}
 
 // Result 统一封装上游响应。Body 与 Stream 二选一：
 // 流式且 2xx 时给 Stream（调用方负责 Close），其余情况 Body 已读完。
@@ -89,11 +151,12 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 	if err != nil {
 		return nil, err
 	}
-	// 复制客户端头，剔除逐跳头与鉴权头（鉴权由池子接管）。
+	// 复制客户端头，剔除逐跳头、入口专有头与鉴权头（鉴权由池子接管）。
 	for k, vs := range hdr {
 		lk := strings.ToLower(k)
-		if hopHeaders[lk] || lk == "authorization" || lk == "host" ||
-			lk == "content-length" || lk == "accept-encoding" {
+		if hopHeaders[lk] || inboundOnlyHeaders[lk] || lk == "authorization" ||
+			lk == "host" || lk == "content-length" || lk == "accept-encoding" ||
+			lk == "user-agent" {
 			continue
 		}
 		for _, v := range vs {
@@ -101,7 +164,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, secre
 		}
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
-	req.Header.Set("User-Agent", c.ua)
+	req.Header.Set("User-Agent", c.pickUA(hdr))
 	if body != nil && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

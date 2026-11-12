@@ -650,6 +650,7 @@ function renderConfig() {
     ['版本', `<code>${esc(d.version || 'dev')}</code>`],
     ['监听', `<code>${esc(d.listen || '—')}</code>`],
     ['上游', `<code>${esc(d.upstream || '—')}</code>`],
+    ['上游 UA', d.upstream_ua ? `<code>${esc(d.upstream_ua)}</code>` : '透传客户端 UA（客户端没带时用内置 SDK 形态）'],
     ['数据目录', `<code>${esc(d.data_dir || '—')}</code>`],
     ['运行时长', fmtDur(d.uptime_seconds || 0)],
     ['自动探活', d.auto_probe ? `${d.auto_probe.enabled ? '开' : '关'} · 每 ${fmtDur(parseDur(d.auto_probe.interval))} · ${probeModel ? '真跑生成 <code>' + esc(probeModel) + '</code>' : '<span class="warn">只拉 /v1/models（看不出欠费）</span>'}` : '—'],

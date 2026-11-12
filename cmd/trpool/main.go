@@ -91,7 +91,7 @@ func main() {
 	prices := usage.NewPrices()
 	daily := usage.NewDaily()
 	sess := session.New(cfg.Pool.SessionSticky.TTL.Duration(), cfg.Pool.SessionSticky.MaxEntries)
-	up := upstream.New(cfg.Upstream)
+	up := upstream.New(cfg.Upstream, upstream.WithUserAgent(cfg.UpstreamUA))
 	p := pool.New(cfg.Pool, sess)
 
 	archiveDir := cfg.Logging.ArchiveDir

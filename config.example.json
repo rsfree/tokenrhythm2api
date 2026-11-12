@@ -6,6 +6,7 @@
   "admin_key": "",
   "client_keys": [],
   "allow_upstream_key_passthrough": false,
+  "upstream_user_agent": "",
 
   "server": {
     "read_timeout": "300s",
