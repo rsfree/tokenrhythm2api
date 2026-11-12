@@ -109,9 +109,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	var lastBody []byte
 	var lastStatus int
-	var lastTrace string
 	var lastErr string
-	var lastVerdict fault.Verdict
+	// 失败也要把 Retry-After 这类语义头带出去（429 的退避全靠它），
+	// 但只带白名单里的，上游其余头一个不放。
+	var lastHeader http.Header
 	// 每次失败尝试的归类：用来判断"这一整轮是不是号都欠费/冻结了"。
 	var failedKinds []fault.Kind
 
@@ -172,7 +173,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.d.Pool.Release(lease, pool.Outcome{
 				Kind: v.Kind, Model: model, Message: v.Message, RetryAfter: v.RetryAfter,
 			})
-			lastStatus, lastBody, lastTrace, lastErr, lastVerdict = res.Status, res.Body, res.TraceID, v.Message, v
+			lastStatus, lastBody, lastErr = res.Status, res.Body, v.Message
+			lastHeader = res.Header
 			failedKinds = append(failedKinds, v.Kind)
 			s.noteFailure(r, reqID, lease, model, path, res.Status, attempt, start, res.TraceID, v.Message)
 
@@ -217,7 +219,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// 原样透传上游的 402/403 会让调用方以为自己欠费、或被永久拒绝，去查自己的账号，
 	// 而真正要做的是给号充值 / 等解封——还得有人在面板上数一遍才知道是哪个号。
 	// 所以这里改写成网关自己的 503，并把池子现状写进 message。
-	errSource := "upstream"
 	if onlyDeadKeys(failedKinds) {
 		total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
 		msg := fmt.Sprintf("号池无可用账号：本次 %d 个号全部欠费或冻结（池内共 %d 个：欠费 %d、冻结 %d、失效 %d、冷却 %d、禁用 %d）",
@@ -230,19 +231,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		lastStatus = http.StatusServiceUnavailable
 		lastBody = errJSON("NO_CAPACITY", msg)
 		lastErr = msg
-		errSource = "pool" // 别让监控按 upstream 归因到上游故障
-		w.Header().Set("X-Trpool-Reason", "keys-dead")
 	}
 
-	if lastVerdict.Kind == fault.ModelDenied {
-		// 把"是这个模型在全部号上都没开通"标出来：客户端换模型才有救，
-		// 否则只会看到一句上游原文，误以为是网关没号。
-		w.Header().Set("X-Trpool-Reason", "model-denied")
-	}
-	w.Header().Set("X-Trpool-Error", errSource)
-	if lastTrace != "" {
-		w.Header().Set("X-Trpool-Trace", lastTrace)
-	}
+	// 不再回任何 X-Trpool-* 头：号名、第几次尝试、上游 trace_id 都是渠道内部信息，
+	// 客户端拿到只会泄露"背后有一池号"。排障这些信息在面板日志与 reqlog 里都有，
+	// 失败原因也能从 body 的 error.code（NO_CAPACITY / UPSTREAM_ERROR…）读出来。
+	copyResponseHeaders(w, lastHeader, false)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(lastStatus)
 	_, _ = w.Write(lastBody)
@@ -272,12 +266,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 
 	if res.Stream != nil {
 		defer res.Close()
-		copySuccessHeaders(w, res.Header, true)
-		w.Header().Set("X-Trpool-Key", lease.Name)
-		w.Header().Set("X-Trpool-Attempt", itoa(attempt))
-		if res.TraceID != "" {
-			w.Header().Set("X-Trpool-Trace", res.TraceID)
-		}
+		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
@@ -325,12 +314,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 		entry.Note = "usage 为估算值"
 	}
 
-	copySuccessHeaders(w, res.Header, false)
-	w.Header().Set("X-Trpool-Key", lease.Name)
-	w.Header().Set("X-Trpool-Attempt", itoa(attempt))
-	if res.TraceID != "" {
-		w.Header().Set("X-Trpool-Trace", res.TraceID)
-	}
+	copyResponseHeaders(w, res.Header, false)
 	w.WriteHeader(res.Status)
 	if len(res.Body) > 0 {
 		_, _ = w.Write(res.Body)
@@ -356,9 +340,6 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 	if res.Status >= 400 {
 		defer res.Close()
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		if res.TraceID != "" {
-			w.Header().Set("X-Trpool-Trace", res.TraceID)
-		}
 		w.WriteHeader(res.Status)
 		_, _ = w.Write(res.Body)
 		return
@@ -372,7 +353,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 	}
 	if res.Stream != nil {
 		defer res.Close()
-		copySuccessHeaders(w, res.Header, true)
+		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
 		u, ttfb, _ := s.pipeSSE(sw, res.Stream, start)
@@ -383,7 +364,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 		entry.Cost = s.d.Prices.Cost(meta.Model, u)
 	} else {
 		u, _ := usage.Parse(res.Body)
-		copySuccessHeaders(w, res.Header, false)
+		copyResponseHeaders(w, res.Header, false)
 		w.WriteHeader(res.Status)
 		_, _ = w.Write(res.Body)
 		entry.LatencyMS = time.Since(start).Milliseconds()
@@ -414,12 +395,26 @@ func onlyDeadKeys(kinds []fault.Kind) bool {
 	return true
 }
 
-func copySuccessHeaders(w http.ResponseWriter, src http.Header, stream bool) {
+// passthroughHeaders 是唯一允许从上游透传给客户端的响应头。
+//
+// 老实现是黑名单：只挡 hop-by-hop，其余原样转发。结果是上游把自己的实现细节
+// 整套送出去——实测 /v1/models 的响应里带着上游的
+// Content-Security-Policy（里面列着它的前端域名、阿里云 OSS、飞书、验证码源）、
+// X-Tr-Frontend-Commit（上游构建 commit）、X-Trace-Id、Server 等等。
+// 这些对客户端毫无用处，却是实打实的渠道泄露。
+//
+// 改成白名单：只留客户端真正需要的那几个。漏掉一个头的代价远小于漏掉内部实现。
+var passthroughHeaders = map[string]bool{
+	"content-type":        true, // 必需：区分 JSON 与 text/event-stream
+	"retry-after":         true, // 429/503 的重试语义，客户端退避行为依赖它
+	"content-disposition": true, // 文件/附件下载的文件名
+	"content-range":       true, // 分片下载
+	"accept-ranges":       true,
+}
+
+func copyResponseHeaders(w http.ResponseWriter, src http.Header, stream bool) {
 	for k, vs := range src {
-		switch strings.ToLower(k) {
-		case "content-length", "connection", "transfer-encoding", "keep-alive",
-			"proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade",
-			"content-encoding":
+		if !passthroughHeaders[strings.ToLower(k)] {
 			continue
 		}
 		for _, v := range vs {
@@ -470,20 +465,6 @@ func injectIncludeUsage(body []byte) []byte {
 		return body
 	}
 	return out
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 func truncate(s string, n int) string {

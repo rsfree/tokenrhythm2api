@@ -177,6 +177,17 @@ func TestHealthz(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(body, `"service":"trpool"`) {
 		t.Fatalf("healthz 异常: %d %s", resp.StatusCode, body)
 	}
+	// 公开端点不带令牌时只回活着，池子规模/欠费数/版本号都不给。
+	for _, leak := range []string{"exhausted", "blocked", "healthy", "version", "uptime"} {
+		if strings.Contains(body, `"`+leak+`"`) {
+			t.Fatalf("无令牌的 healthz 不该暴露 %s：%s", leak, body)
+		}
+	}
+	// 带管理令牌才给全量，运维脚本照旧能用。
+	resp, body = h.do(t, http.MethodGet, "/healthz", "", map[string]string{"Authorization": "Bearer admin-test"})
+	if resp.StatusCode != 200 || !strings.Contains(body, `"healthy"`) || !strings.Contains(body, `"version"`) {
+		t.Fatalf("带 admin 令牌应回全量: %d %s", resp.StatusCode, body)
+	}
 }
 
 func TestRetryOn5xxSwitchesKey(t *testing.T) {
@@ -203,8 +214,13 @@ func TestRetryOn5xxSwitchesKey(t *testing.T) {
 	if hits[0].secret != keyA || hits[1].secret != keyB {
 		t.Fatalf("应先在 A 失败再换 B，实际 %+v", hits)
 	}
-	if resp.Header.Get("X-Trpool-Attempt") != "2" {
-		t.Fatalf("应标注第 2 次尝试，实际 %q", resp.Header.Get("X-Trpool-Attempt"))
+	if resp.Header.Get("X-Trpool-Attempt") != "" {
+		t.Fatalf("不应再回 X-Trpool-Attempt（渠道信息不外泄），实际 %q", resp.Header.Get("X-Trpool-Attempt"))
+	}
+	// 第几次尝试改由日志承载：面板上还能看到，客户端不再看得到。
+	logs := h.log.Recent(1)
+	if len(logs) != 1 || logs[0].Attempt != 2 {
+		t.Fatalf("日志里应记第 2 次尝试，实际 %+v", logs)
 	}
 }
 
@@ -464,8 +480,13 @@ func TestAllKeysDeadReturns503(t *testing.T) {
 	if !strings.Contains(body, "欠费 2") {
 		t.Fatalf("错误体应带上池子现状（欠费 2），实际 %s", body)
 	}
-	if got := resp.Header.Get("X-Trpool-Reason"); got != "keys-dead" {
-		t.Fatalf("应标 X-Trpool-Reason: keys-dead，实际 %q", got)
+	// 不再回 X-Trpool-* 头：号名/尝试次数/上游 trace 都是渠道内部信息。
+	// 客户端靠 body 的 error.code 识别，排障靠面板日志。
+	for _, hk := range []string{"X-Trpool-Reason", "X-Trpool-Error", "X-Trpool-Key",
+		"X-Trpool-Attempt", "X-Trpool-Trace"} {
+		if v := resp.Header.Get(hk); v != "" {
+			t.Fatalf("不该再返回 %s，实际 %q", hk, v)
+		}
 	}
 	if c := h.fk.count(); c != 2 {
 		t.Fatalf("两个号各撞一次，实际 %d 次", c)
@@ -549,5 +570,91 @@ func TestBodyTooLarge(t *testing.T) {
 	resp, _ := h.do(t, http.MethodPost, "/v1/chat/completions", string(body), nil)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("超限应 413，实际 %d", resp.StatusCode)
+	}
+}
+
+// 上游的响应头一个都不许漏给客户端。
+//
+// 老实现是黑名单透传（只挡 hop-by-hop），实测 /v1/models 会把上游的
+// Content-Security-Policy（里面列着它的前端域名、阿里云 OSS、飞书、验证码源）、
+// X-Tr-Frontend-Commit（上游构建 commit）、X-Trace-Id、Server 一起送给调用方。
+// 这里把那些头全塞进假上游，确认客户端只看到白名单里的几个。
+func TestUpstreamHeadersDoNotLeak(t *testing.T) {
+	h := newHarness(t, nil)
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Security-Policy", "default-src 'self' https://tokenrhythm.studio https://static.tokenrhythm.studio")
+		w.Header().Set("X-Tr-Frontend-Commit", "01e8b136f77666a17e325ae8a2979f60109d984e")
+		w.Header().Set("X-Tr-Frontend-Cohort", "base")
+		w.Header().Set("X-Trace-Id", "trace_deadbeef")
+		w.Header().Set("Server", "Tengine")
+		w.Header().Set("X-Powered-By", "Next.js")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		w.Header().Set("Permissions-Policy", "camera=()")
+		w.Header().Set("X-RateLimit-Remaining", "999")
+		w.Header().Set("Set-Cookie", "upstream_session=abc; Path=/")
+		_, _ = io.WriteString(w, `{"id":"ok"}`)
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("应 200，实际 %d %s", resp.StatusCode, body)
+	}
+	for _, k := range []string{"Content-Security-Policy", "X-Tr-Frontend-Commit",
+		"X-Tr-Frontend-Cohort", "X-Trace-Id", "Server", "X-Powered-By",
+		"Strict-Transport-Security", "Permissions-Policy", "X-RateLimit-Remaining",
+		"Set-Cookie"} {
+		if v := resp.Header.Get(k); v != "" {
+			t.Fatalf("上游头 %s 不该透传给客户端，实际 %q", k, v)
+		}
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("Content-Type 必须保留，实际 %q", ct)
+	}
+	if strings.TrimSpace(body) != `{"id":"ok"}` {
+		t.Fatalf("响应体应原样透传，实际 %q", body)
+	}
+}
+
+// Retry-After 是唯一允许透传的"上游语义头"：429/503 的退避行为依赖它。
+func TestRetryAfterPassesThrough(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}
+	resp, _ := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if got := resp.Header.Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After 应透传，实际 %q", got)
+	}
+}
+
+// 流式也不能漏：SSE 只要 Content-Type，别把上游的 CSP / commit 带出去。
+func TestStreamHeadersDoNotLeak(t *testing.T) {
+	h := newHarness(t, nil)
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Security-Policy", "default-src 'self' https://tokenrhythm.studio")
+		w.Header().Set("X-Tr-Frontend-Commit", "deadbeef")
+		w.Header().Set("X-Request-Id", "upstream-req-1")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}
+	resp, _ := h.do(t, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("流式应 200，实际 %d", resp.StatusCode)
+	}
+	for _, k := range []string{"Content-Security-Policy", "X-Tr-Frontend-Commit"} {
+		if v := resp.Header.Get(k); v != "" {
+			t.Fatalf("流式响应里不该出现上游头 %s，实际 %q", k, v)
+		}
+	}
+	// X-Request-Id 是网关自己生成的那个，不能是上游回显的。
+	if got := resp.Header.Get("X-Request-Id"); got == "upstream-req-1" {
+		t.Fatal("X-Request-Id 不该取上游的值")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("SSE 的 Content-Type 必须保留，实际 %q", ct)
 	}
 }

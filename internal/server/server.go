@@ -72,7 +72,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case path == "/healthz":
-		s.handleHealth(w)
+		s.handleHealth(w, r)
 	case path == "/status":
 		s.handleStatus(w, r)
 	case strings.HasPrefix(path, "/panel"):
@@ -92,7 +92,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleHealth 给负载均衡/宿主探活用。永远 200：进程活着就是活着；
 // 号池健康度放在字段里，不拿 503 让编排系统去重启一个"只是暂时没号"的进程。
-func (s *Server) handleHealth(w http.ResponseWriter) {
+//
+// 但它是**公开**端点（反代不鉴权、探针在用）：不带 admin 令牌只回"我还活着"。
+// 池子规模、几个号欠费、版本号都属于内部信息——谁都能查就等于对外公布
+// "这后面挂着一池号，其中 20 个没钱了"。
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if !httpauth.VerifyBearer(r, s.d.Live.Load().AdminKey) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "trpool"})
+		return
+	}
 	total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
 	st := s.d.Pool.BatchState()
 	writeJSON(w, http.StatusOK, map[string]any{

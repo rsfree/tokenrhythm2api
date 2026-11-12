@@ -137,17 +137,25 @@ print(client.chat.completions.create(
 `stream: true` 按 SSE **逐行透传**，不改缓冲、不攒包；静默超过 `server.stream_keepalive`（默认 15s）
 补一行 `: keepalive` 注释帧，防止中间反代按空闲超时掐断（SSE 规范里以 `:` 开头的行就是注释，SDK 会跳过）。
 
-响应头带诊断信息，出问题不用翻日志也能定位：
+### 响应头：不回任何渠道信息
 
-| 头 | 含义 |
+网关**不返回** `X-Trpool-*` 系列（号名、第几次尝试、上游 trace_id 全部去掉），
+也**不透传上游的任何响应头**。上游头曾是黑名单转发（只挡 hop-by-hop），
+实测 `/v1/models` 会把上游的 `Content-Security-Policy`（里面列着它的前端域名、
+阿里云 OSS、飞书、验证码源）、`X-Tr-Frontend-Commit`（上游构建 commit）、
+`X-Trace-Id`、`Server` 一并送给调用方——那是实打实的渠道泄露。
+
+现在白名单只放行这四类：
+
+| 头 | 为什么留 |
 |---|---|
-| `X-Trpool-Key` | 本次实际使用的号名 |
-| `X-Trpool-Attempt` | 第几次尝试（1 = 一次成功） |
-| `X-Trpool-Trace` | 上游 trace_id，对工单用 |
-| `X-Trpool-Reason: model-denied` | 模型级封禁，换号也无解 |
-| `X-Trpool-Reason: keys-dead` | 这一轮撞到的号全部欠费/冻结，已改写成 503 |
-| `X-Trpool-Error: upstream` | 换满 `retry_max` 仍未成功 |
-| `X-Trpool-Error: pool` | 失败根因在号池（欠费/冻结），不是上游炸了 |
+| `Content-Type` | 客户端必须能区分 JSON 与 `text/event-stream` |
+| `Retry-After` | 429/503 的退避语义，客户端行为依赖它 |
+| `Content-Disposition` | 文件下载的文件名 |
+| `Range` 相关（`Content-Range`、`Accept-Ranges`） | 分片下载 |
+
+其余一律丢弃。排障需要的信息（是哪个号、第几次、上游 trace）都在面板「运行日志」
+与 `data/requests/*.jsonl` 里，客户端按 `error.code`（`NO_CAPACITY` / `UPSTREAM_ERROR`…）判断即可。
 
 ---
 
@@ -425,8 +433,8 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 | 否 | `503 NO_CAPACITY`「号池无可用账号：本次 N 个号全部欠费或冻结（池内共 M 个：欠费 a、冻结 b、失效 c、冷却 d、禁用 e）」 |
 | 是（只是这一轮抽到死号） | `503 NO_CAPACITY`「本轮 N 个号都已欠费或冻结，池内仍有 M 个可用号，请重试」 |
 
-两种都带 `X-Trpool-Reason: keys-dead`。**5xx / 网络错误 / 429 掺进来一条就不改写**——
-那种情况保留上游原文排障更有用。
+两种都是 `error.code = NO_CAPACITY`（客户端按它判断，不再依赖响应头）。
+**5xx / 网络错误 / 429 掺进来一条就不改写**——那种情况保留上游原文排障更有用。
 
 日志页右上角「历史归档」按钮切成归档模式（服务端过滤，因为归档可能有几十万行）。
 
@@ -545,7 +553,11 @@ POST   /panel/api/prices                        # 刷新价目表
 GET    /panel/api/config                        # 运行时信息
 ```
 
-另外两个非面板端点：`GET /healthz`（无鉴权，容器探针用）、`GET /status`（需 admin，JSON 快照）。
+另外两个非面板端点：`GET /healthz`、`GET /status`（需 admin，JSON 快照）。
+
+`/healthz` **无鉴权时只回 `{"ok":true,"service":"trpool"}`**——它是公开端点，池子规模、
+几个号欠费、版本号都算内部信息，不该让谁都能查。带上 admin 令牌才返回计数与运行时长，
+容器探针与监控脚本两种用法都照顾到。
 
 ---
 

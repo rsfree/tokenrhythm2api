@@ -13,19 +13,13 @@ import (
 //go:embed web/index.html web/app.js web/style.css
 var webFS embed.FS
 
-// csp 是严格内容安全策略（无需 unsafe-inline 跑脚本）：
-//   - default-src 'none'     默认全禁，逐个开口
-//   - script-src 'self'      只跑同源脚本；页面无内联事件处理器
-//   - style-src 'self' 'unsafe-inline'  页面有少量 style="..."（进度条宽度），
-//     允许内联样式不会导致脚本执行
-//   - connect-src 'self'     前端 fetch 只能打本服务
-//   - frame-ancestors 'none' 禁止被 iframe 嵌套（点击劫持）
-const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-	"connect-src 'self'; img-src 'self' data:; form-action 'none'; " +
-	"frame-ancestors 'none'; base-uri 'none'"
-
+// setSecurityHeaders 只留"不透露实现"的几条硬性防护。
+//
+// 去掉了 Content-Security-Policy：它会把面板的脚本/连接源清单写进响应头，
+// 属于对外暴露自身实现细节（上游 API 的 CSP 更夸张，直接列了它的域名与 OSS）。
+// 面板的抗 XSS 现在靠两点：模板里所有上游文本都过 esc()，以及 admin 令牌鉴权。
+// nosniff / X-Frame-Options 这类不泄露信息的头保留——它们只约束浏览器行为。
 func setSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")

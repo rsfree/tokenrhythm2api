@@ -231,8 +231,15 @@ func TestPanelLogsAndStatic(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(page, "<html") {
 		t.Fatalf("首页异常: %d", resp.StatusCode)
 	}
-	if resp.Header.Get("Content-Security-Policy") == "" || resp.Header.Get("ETag") == "" {
-		t.Fatal("缺 CSP 或 ETag")
+	if resp.Header.Get("ETag") == "" {
+		t.Fatal("缺 ETag")
+	}
+	// 面板不再回 CSP：那会把自身脚本/连接源清单写进响应头，属于暴露实现细节。
+	if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
+		t.Fatalf("不该再返回 Content-Security-Policy，实际 %q", csp)
+	}
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("不泄露实现的防护头应保留（nosniff）")
 	}
 	resp, js := h.call(t, http.MethodGet, "/panel/app.js", "", false)
 	if resp.StatusCode != 200 || len(js) == 0 {
