@@ -137,7 +137,7 @@ print(client.chat.completions.create(
 `stream: true` 按 SSE **逐行透传**，不改缓冲、不攒包；静默超过 `server.stream_keepalive`（默认 15s）
 补一行 `: keepalive` 注释帧，防止中间反代按空闲超时掐断（SSE 规范里以 `:` 开头的行就是注释，SDK 会跳过）。
 
-### 响应头：不回任何渠道信息
+### 响应头与响应体：不回任何渠道信息
 
 网关**不返回** `X-Trpool-*` 系列（号名、第几次尝试、上游 trace_id 全部去掉），
 也**不透传上游的任何响应头**。上游头曾是黑名单转发（只挡 hop-by-hop），
@@ -156,6 +156,29 @@ print(client.chat.completions.create(
 
 其余一律丢弃。排障需要的信息（是哪个号、第几次、上游 trace）都在面板「运行日志」
 与 `data/requests/*.jsonl` 里，客户端按 `error.code`（`NO_CAPACITY` / `UPSTREAM_ERROR`…）判断即可。
+
+**body 也过一遍脱敏**（`internal/redact`）。上游在自己 JSON 里塞了不少"这不是给客户看的"字段：
+
+| 删掉的字段 | 它是什么 |
+|---|---|
+| `trace_id` / `traceId` | 上游链路 ID，能拿去上游工单系统对账 |
+| `cost_cny` / `billing_pending` / `billing` | **这笔请求在上游的真实扣费 = 你的进货价** |
+| `input_price_per_million` 等 11 个价目字段、`pricing` 系列 | `/v1/models` 里整张进货价目表 |
+| `owned_by` 的取值 | 上游品牌名，改成中性的 `system`（字段本身保留） |
+
+文本里出现的上游域名（402 那句"充值地址：`https://<上游>/account/recharge`"、
+错误 message 里的文档链接）替换成 `[hidden]`。网络错误对外只回
+「上游连接失败，请稍后重试」，不再带 `Get "https://…": dial tcp …` 这种原始错误。
+
+要点：
+
+- **脱敏在记账之后**。`cost_cny` 是本地成本口径（`usage.Parse` 的 `Direct`），
+  先洗再算只会把每笔成本记成 0。流式同理：先 `scanUsageLine` 再替换那一帧。
+- **`owned_by` 只能改值不能删**。openai SDK 的 `Model` 里它是必填字段，
+  删了客户端解析 `/v1/models` 会抛 ValidationError。
+- 只处理 JSON；非 JSON 响应体（文件、视频二进制）只做域名替换，不动结构。
+- 超过 32MB 的体、以及 `Content-Type` 不是 JSON 的，不重新序列化，避免无谓开销。
+- 面板与 `data/requests/*.jsonl` **保留原文**——运营侧要能用这些字段排障。
 
 ---
 
@@ -426,15 +449,18 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 
 一轮里被撞到的号**全部**是 402（欠费）/ 403（冻结）时，网关不会把上游那句
 `INSUFFICIENT_BALANCE` 原样丢给客户端——那是**号池的账**，不是调用方的账，
-透传只会让人去查自己的账号。改成网关自己的 503：
+透传只会让人去查自己的账号。改成网关自己的 503，且**不描述池子状态**：
+池里有几个号、几个欠费、还剩几个可用，都是内部经营数据。
 
-| 池内还有活号 | 返回 |
-|---|---|
-| 否 | `503 NO_CAPACITY`「号池无可用账号：本次 N 个号全部欠费或冻结（池内共 M 个：欠费 a、冻结 b、失效 c、冷却 d、禁用 e）」 |
-| 是（只是这一轮抽到死号） | `503 NO_CAPACITY`「本轮 N 个号都已欠费或冻结，池内仍有 M 个可用号，请重试」 |
+```json
+{"error":{"code":"NO_CAPACITY","type":"NO_CAPACITY","message":"当前无可用容量，请稍后重试"}}
+```
 
-两种都是 `error.code = NO_CAPACITY`（客户端按它判断，不再依赖响应头）。
-**5xx / 网络错误 / 429 掺进来一条就不改写**——那种情况保留上游原文排障更有用。
+这一轮到底撞了什么（`本轮 2 个号全部欠费或冻结（池内共 2 个：欠费 2、冻结 0…可用 0）`）
+写进 `data/requests/*.jsonl` 与面板「运行日志」，客户端拿不到。
+
+**5xx / 网络错误 / 429 掺进来一条就不改写**——那种情况保留上游原文排障更有用
+（原文同样会过 body 脱敏，删掉 `traceId` 与上游域名）。
 
 日志页右上角「历史归档」按钮切成归档模式（服务端过滤，因为归档可能有几十万行）。
 

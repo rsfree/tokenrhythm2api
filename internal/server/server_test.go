@@ -15,6 +15,7 @@ import (
 	"trpool/internal/fault"
 	"trpool/internal/livecfg"
 	"trpool/internal/pool"
+	"trpool/internal/redact"
 	"trpool/internal/reqlog"
 	"trpool/internal/session"
 	"trpool/internal/upstream"
@@ -474,11 +475,25 @@ func TestAllKeysDeadReturns503(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("号全欠费应回 503，而不是把上游 402 透传给客户端，实际 %d %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "NO_CAPACITY") || !strings.Contains(body, "号池无可用账号") {
-		t.Fatalf("错误体应说清是号池空了，实际 %s", body)
+	if !strings.Contains(body, "NO_CAPACITY") || !strings.Contains(body, "当前无可用容量") {
+		t.Fatalf("错误体应说清是网关侧没容量，实际 %s", body)
 	}
-	if !strings.Contains(body, "欠费 2") {
-		t.Fatalf("错误体应带上池子现状（欠费 2），实际 %s", body)
+	// 池子规模、欠费/冻结分布都是内部经营数据，一个字都不该出现在给客户端的 body 里。
+	for _, leak := range []string{"欠费", "冻结", "池内共", "号池", "余额"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("错误体泄露了渠道内部信息（%q），实际 %s", leak, body)
+		}
+	}
+	// 但面板/归档要能查到这一轮到底撞了什么。
+	logs := h.log.Recent(10)
+	var seen string
+	for _, e := range logs {
+		if strings.Contains(e.Error, "欠费 2") {
+			seen = e.Error
+		}
+	}
+	if seen == "" {
+		t.Fatalf("日志里应保留池子现状（欠费 2），实际 %+v", logs)
 	}
 	// 不再回 X-Trpool-* 头：号名/尝试次数/上游 trace 都是渠道内部信息。
 	// 客户端靠 body 的 error.code 识别，排障靠面板日志。
@@ -499,7 +514,7 @@ func TestAllKeysDeadReturns503(t *testing.T) {
 }
 
 // 池里还有活号、只是这一轮抽到的都是死号：仍然不能透传 402（那是上游号的账），
-// 但也不能谎报"号池无可用账号"——让客户端重试就行。
+// 也不能对外描述池子状态——"还有 1 个可用"同样是在告诉客户端背后有几个号。
 func TestDeadRoundWithLiveKeysAsksRetry(t *testing.T) {
 	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
 	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
@@ -510,8 +525,13 @@ func TestDeadRoundWithLiveKeysAsksRetry(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("应回 503，实际 %d %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "请重试") || strings.Contains(body, "号池无可用账号") {
-		t.Fatalf("池内仍有活号时应让客户端重试，实际 %s", body)
+	if !strings.Contains(body, "请稍后重试") {
+		t.Fatalf("应提示稍后重试，实际 %s", body)
+	}
+	for _, leak := range []string{"可用 1", "池内", "冻结", "本轮"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("不该对外描述池子状态（%q），实际 %s", leak, body)
+		}
 	}
 }
 
@@ -656,5 +676,114 @@ func TestStreamHeadersDoNotLeak(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("SSE 的 Content-Type 必须保留，实际 %q", ct)
+	}
+}
+
+// ---------- 响应体脱敏 ----------
+
+// 上游在自己的成功响应里塞了 cost_cny（这笔请求的进货价）和 trace_id（渠道链路 ID）。
+// 客户端一个都不该看到，但本地记账必须用得上——脱敏只能发生在解析之后。
+func TestSuccessBodyRedacted(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.scrub = redact.New("https://tokenrhythm.studio")
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","model":"glm-5.1","choices":[{"message":{"content":"hi"}}],`+
+			`"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8},`+
+			`"cost_cny":"0.00001234","billing_pending":false,"trace_id":"trace_leak_me"}`)
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("应 200，实际 %d %s", resp.StatusCode, body)
+	}
+	for _, leak := range []string{"cost_cny", "billing_pending", "trace_id", "trace_leak_me"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("响应体泄露了 %s：%s", leak, body)
+		}
+	}
+	if !strings.Contains(body, `"total_tokens":8`) || !strings.Contains(body, "hi") {
+		t.Fatalf("业务字段不能被误删：%s", body)
+	}
+	// 记账走的是上游 cost_cny（Direct）。如果脱敏在解析之前，这里会是 0。
+	e := h.log.Recent(1)[0]
+	if e.Cost < 0.0000123 || e.Cost > 0.0000124 {
+		t.Fatalf("上游 cost_cny 应被记账（0.00001234），实际 %v", e.Cost)
+	}
+}
+
+// 流式：末帧的 cost_cny / trace_id 也要抹掉，但 usage 与 [DONE] 必须原样。
+func TestStreamBodyRedacted(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.scrub = redact.New("https://tokenrhythm.studio")
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3},\"cost_cny\":\"0.00000120\",\"trace_id\":\"trace_leak_sse\"}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}
+	reqBody := `{"model":"glm-5.1","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", reqBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("应 200，实际 %d %s", resp.StatusCode, body)
+	}
+	for _, leak := range []string{"cost_cny", "trace_id", "trace_leak_sse"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("SSE 泄露了 %s：%s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "[DONE]") || !strings.Contains(body, `"total_tokens":3`) {
+		t.Fatalf("usage / [DONE] 不能被误伤：%s", body)
+	}
+	// 流式的 usage 同样要在脱敏前读到，否则 token 记账全是 0。
+	e := h.log.Recent(1)[0]
+	if e.PromptTokens != 2 || e.CompletionTokens != 1 {
+		t.Fatalf("流式 usage 应记为 2/1，实际 %d/%d", e.PromptTokens, e.CompletionTokens)
+	}
+}
+
+// 失败时透传的是上游原话：4xx 里可能带着上游域名、文档链接和 traceId。
+func TestErrorBodyRedacted(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h.srv.scrub = redact.New("https://tokenrhythm.studio")
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.WriteHeader(400)
+		_, _ = io.WriteString(w, `{"code":"MODEL_NOT_AVAILABLE","message":"模型不可用，详见 https://tokenrhythm.studio/docs/models","traceId":"trace_9e06b3c0"}`)
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != 400 {
+		t.Fatalf("客户端错误应原样回 400，实际 %d %s", resp.StatusCode, body)
+	}
+	for _, leak := range []string{"tokenrhythm", "traceId", "trace_9e06b3c0"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("错误体泄露了 %s：%s", leak, body)
+		}
+	}
+	// 错误码与 message 主体要留着，否则客户端没法判断是"模型不存在"还是"网关挂了"。
+	if !strings.Contains(body, "MODEL_NOT_AVAILABLE") || !strings.Contains(body, "模型不可用") {
+		t.Fatalf("错误语义不能被一起抹掉：%s", body)
+	}
+}
+
+// 网络错误：Go 的 *url.Error 形如 `Get "https://<上游>/v1/...": dial tcp ...`，
+// 原样回给客户端等于把上游域名与端点路径送出去。
+func TestNetworkErrorMessageHidesUpstream(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h.up.Close() // 端口关掉，制造连接失败
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("连接失败应 502，实际 %d %s", resp.StatusCode, body)
+	}
+	for _, leak := range []string{"http://", "https://", "127.0.0.1", "dial", "connection refused"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("网络错误体泄露了 %s：%s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "UPSTREAM_ERROR") {
+		t.Fatalf("应保留错误码：%s", body)
+	}
+	// 细节不能丢，日志里要看得到真实原因。
+	logs := h.log.Recent(5)
+	if len(logs) == 0 || !strings.Contains(logs[0].Error, "连接上游失败") {
+		t.Fatalf("日志应保留原始网络错误，实际 %+v", logs)
 	}
 }

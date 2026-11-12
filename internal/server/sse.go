@@ -118,13 +118,15 @@ func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, start time.Time) (usag
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, werr := sw.Write(line); werr != nil {
+			// 顺序不能换：scanUsageLine 要靠 cost_cny 这一帧记账，
+			// 先脱敏的话那个字段已经没了，成本会全部记成 0。
+			scanUsageLine(line, &u)
+			if _, werr := sw.Write(s.scrub.SSELine(line)); werr != nil {
 				return u, ttfb, werr // 客户端断了，别再往上游要数据
 			}
 			if ttfb < 0 {
 				ttfb = time.Since(start).Milliseconds()
 			}
-			scanUsageLine(line, &u)
 		}
 		if err != nil {
 			if err == io.EOF {

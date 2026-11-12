@@ -17,6 +17,7 @@ import (
 	"trpool/internal/httpauth"
 	"trpool/internal/livecfg"
 	"trpool/internal/pool"
+	"trpool/internal/redact"
 	"trpool/internal/reqlog"
 	"trpool/internal/upstream"
 	"trpool/internal/usage"
@@ -56,10 +57,17 @@ type Server struct {
 	panel   http.Handler
 	started time.Time
 	stats   Stats
+	// scrub 抹掉上游响应体里的渠道信息（trace_id、cost_cny、价目表、上游域名）。
+	// 只作用于给客户端的方向；面板与 reqlog 仍保留原文。
+	scrub *redact.Scrubber
 }
 
 func New(d Deps) *Server {
-	return &Server{d: d, started: time.Now()}
+	base := ""
+	if d.Up != nil {
+		base = d.Up.Base()
+	}
+	return &Server{d: d, started: time.Now(), scrub: redact.New(base)}
 }
 
 // MountPanel 由 main 注入，避免 server 反向依赖 panel。

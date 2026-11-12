@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -156,7 +157,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				Kind: fault.Upstream, Model: model, Message: err.Error(),
 			})
 			lastStatus = http.StatusBadGateway
-			lastBody = errJSON("UPSTREAM_ERROR", err.Error())
+			lastBody = errJSON("UPSTREAM_ERROR", publicErrMessage(err))
 			lastErr = err.Error()
 			failedKinds = append(failedKinds, fault.Upstream)
 			s.noteFailure(r, reqID, lease, model, path, lastStatus, attempt, start, "", err.Error())
@@ -221,26 +222,45 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// 所以这里改写成网关自己的 503，并把池子现状写进 message。
 	if onlyDeadKeys(failedKinds) {
 		total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
-		msg := fmt.Sprintf("号池无可用账号：本次 %d 个号全部欠费或冻结（池内共 %d 个：欠费 %d、冻结 %d、失效 %d、冷却 %d、禁用 %d）",
-			len(failedKinds), total, exhausted, blocked, invalid, cooling, disabled)
-		if healthy > 0 {
-			// 池里还有活号，只是这一轮抽到的全是死号：让客户端重试即可，别谎报"没有账号"。
-			msg = fmt.Sprintf("本轮 %d 个号都已欠费或冻结，池内仍有 %d 个可用号，请重试",
-				len(failedKinds), healthy)
-		}
+		// 池子规模、欠费/冻结的分布是内部经营数据：抛给客户端等于告诉对方
+		// "这后面挂着 N 个号，其中 M 个已经没钱了"。客户端只需要知道
+		// "不是你的事，重试或找服务方"，所以对外只回一句中性的容量不足，
+		// 明细走 reqlog——面板上照样能查到这一轮到底撞了什么。
+		detail := fmt.Sprintf("本轮 %d 个号全部欠费或冻结（池内共 %d 个：欠费 %d、冻结 %d、失效 %d、冷却 %d、禁用 %d、可用 %d）",
+			len(failedKinds), total, exhausted, blocked, invalid, cooling, disabled, healthy)
 		lastStatus = http.StatusServiceUnavailable
-		lastBody = errJSON("NO_CAPACITY", msg)
-		lastErr = msg
+		lastBody = errJSON("NO_CAPACITY", "当前无可用容量，请稍后重试")
+		lastErr = detail
+		s.noteFailure(r, reqID, nil, model, path, http.StatusServiceUnavailable, maxAttempts, start, "", detail)
 	}
 
 	// 不再回任何 X-Trpool-* 头：号名、第几次尝试、上游 trace_id 都是渠道内部信息，
 	// 客户端拿到只会泄露"背后有一池号"。排障这些信息在面板日志与 reqlog 里都有，
 	// 失败原因也能从 body 的 error.code（NO_CAPACITY / UPSTREAM_ERROR…）读出来。
+	//
+	// body 同样要过一遍脱敏：失败时透传的是上游原话，里面可能带着上游的
+	// traceId、以及 402 那句"充值地址：https://<上游域名>/account/recharge"。
 	copyResponseHeaders(w, lastHeader, false)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(lastStatus)
-	_, _ = w.Write(lastBody)
+	_, _ = w.Write(s.scrub.Body(lastBody))
 	s.d.Daily.Add(time.Now(), 0, 0, 0, true)
+}
+
+// publicErrMessage 是给客户端看的网络错误文案。
+//
+// upstream 层包出来的错误里带着完整 URL（Go 的 *url.Error 形如
+// `Get "https://<上游>/v1/chat/completions": dial tcp ...`），原样回给客户端
+// 等于把上游域名和端点路径送出去。而 "connection refused" 对调用方没有任何
+// 可操作价值，所以对外只给一句粗粒度描述，细节留在 reqlog。
+func publicErrMessage(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "上游响应超时，请稍后重试"
+	case errors.Is(err, context.Canceled):
+		return "请求已取消"
+	}
+	return "上游连接失败，请稍后重试"
 }
 
 func (s *Server) timeoutFor(video bool) time.Duration {
@@ -317,7 +337,9 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 	copyResponseHeaders(w, res.Header, false)
 	w.WriteHeader(res.Status)
 	if len(res.Body) > 0 {
-		_, _ = w.Write(res.Body)
+		// 记账已经读完（usage.Parse / videoID 都在这之前），这时才轮到脱敏：
+		// 上游的 cost_cny 是本地记账要用的进货价，先洗掉就只剩 0 了。
+		_, _ = w.Write(s.scrub.Body(res.Body))
 	}
 	s.d.Log.Record(entry)
 	s.d.Daily.Add(entry.Time, u.Prompt, u.Completion, cost, false)
