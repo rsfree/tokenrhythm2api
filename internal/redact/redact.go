@@ -29,6 +29,10 @@ var dropKeys = map[string]bool{
 	// 上游结算字段：cost_cny 是这笔请求在上游的真实扣费，即进货价。
 	"cost_cny": true, "billing_pending": true, "billing": true,
 
+	// 推理引擎的权重版本（metadata.weight_version(s)）：客户端一辈子用不到，
+	// 却能看出上游在跑什么引擎、同时挂了几个权重版本。
+	"weight_version": true, "weight_versions": true,
+
 	// /v1/models 里的完整价目表（上游扩展字段，OpenAI 标准里没有）。
 	// 留着等于把进货价印在商品标签上：客户一眼就能算出你加了多少。
 	"currency":                               true,

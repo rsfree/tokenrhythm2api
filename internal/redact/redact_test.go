@@ -170,3 +170,18 @@ func TestEmptyBaseStillDropsFields(t *testing.T) {
 		t.Fatalf("空 base 也应删字段：%s", out)
 	}
 }
+
+// 推理引擎的权重版本是上游部署细节，客户端用不到。
+func TestBodyDropsEngineMetadata(t *testing.T) {
+	s := New("https://tokenrhythm.studio")
+	in := `{"id":"chatcmpl-1","metadata":{"weight_version":"default","weight_versions":[{"start":0,"end":1,"version":"default"}]},"usage":{"total_tokens":14}}`
+	out := string(s.Body([]byte(in)))
+	for _, leak := range []string{"weight_version", "weight_versions", "default"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("应删掉引擎元信息 %s：%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `"total_tokens":14`) {
+		t.Errorf("业务字段不能误删：%s", out)
+	}
+}
