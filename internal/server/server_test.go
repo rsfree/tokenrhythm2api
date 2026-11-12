@@ -32,6 +32,7 @@ type hit struct {
 	secret string
 	path   string
 	body   string
+	hdr    http.Header
 }
 
 type fake struct {
@@ -51,7 +52,7 @@ func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.seen[secret]++
 	n := f.seen[secret]
-	f.log = append(f.log, hit{secret: secret, path: r.URL.Path, body: string(body)})
+	f.log = append(f.log, hit{secret: secret, path: r.URL.Path, body: string(body), hdr: r.Header.Clone()})
 	f.mu.Unlock()
 
 	if f.behave == nil {
@@ -785,5 +786,50 @@ func TestNetworkErrorMessageHidesUpstream(t *testing.T) {
 	logs := h.log.Recent(5)
 	if len(logs) == 0 || !strings.Contains(logs[0].Error, "连接上游失败") {
 		t.Fatalf("日志应保留原始网络错误，实际 %+v", logs)
+	}
+}
+
+// 出站方向的两个"自报身份"漏洞：UA 写死成 trpool/2 + 仓库地址，
+// 以及把客户端的 X-Forwarded-For / X-Real-IP / Origin / Cookie 原样转给上游。
+// 前者是"同一出口 IP 一池号同指纹"，后者是把终端用户 IP 与网关域名交上去。
+func TestOutboundDoesNotLeakIdentity(t *testing.T) {
+	h := newHarness(t, nil)
+	ua := "OpenAI/Python 1.99.0"
+	hdr := map[string]string{
+		"User-Agent":        ua,
+		"X-Forwarded-For":   "203.0.113.7, 10.0.0.1",
+		"X-Real-IP":         "203.0.113.7",
+		"Forwarded":         "for=203.0.113.7",
+		"CF-Connecting-IP":  "203.0.113.7",
+		"Via":               "1.1 tengine",
+		"Origin":            "https://trpool.example.com",
+		"Referer":           "https://trpool.example.com/panel/",
+		"Cookie":            "trpool_admin=leak",
+		"Anthropic-Version": "2023-06-01",
+	}
+	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, hdr)
+	if resp.StatusCode != 200 {
+		t.Fatalf("正常请求应 200，实际 %d %s", resp.StatusCode, body)
+	}
+	if h.fk.count() != 1 {
+		t.Fatalf("应只有一次上游请求，实际 %d", h.fk.count())
+	}
+	got := h.fk.hits()[0].hdr
+
+	if v := got.Get("User-Agent"); v != ua {
+		t.Errorf("UA = %q，应透传客户端 UA", v)
+	}
+	for _, k := range []string{"X-Forwarded-For", "X-Real-Ip", "Forwarded", "Cf-Connecting-Ip",
+		"Via", "Origin", "Referer", "Cookie"} {
+		if v := got.Values(k); len(v) > 0 {
+			t.Errorf("不该转发的头漏了 %s = %v", k, v)
+		}
+	}
+	// 协议头要留着，否则上游会按"异常客户端"处理。
+	if v := got.Get("Anthropic-Version"); v != "2023-06-01" {
+		t.Errorf("Anthropic-Version = %q，应照常转发", v)
+	}
+	if v := got.Get("Authorization"); v != "Bearer "+keyA && v != "Bearer "+keyB {
+		t.Errorf("Authorization = %q，应换成池子里的号", v)
 	}
 }
