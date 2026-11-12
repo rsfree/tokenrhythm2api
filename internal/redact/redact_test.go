@@ -8,10 +8,10 @@ import (
 
 func TestBodyDropsCostAndTrace(t *testing.T) {
 	s := New("https://tokenrhythm.studio")
-	in := `{"id":"chatcmpl-1","model":"m","usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8},"cost_cny":"0.00007740","billing_pending":false,"trace_id":"trace_da97"}`
+	in := `{"id":"chatcmpl-1","model":"m","usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8},"cost_cny":"0.00007740","billing_pending":false,"trace_id":"trace_da97","request_id":"11daea38-e8f9"}`
 	out := string(s.Body([]byte(in)))
 
-	for _, leak := range []string{"cost_cny", "billing_pending", "trace_id", "trace_da97"} {
+	for _, leak := range []string{"cost_cny", "billing_pending", "trace_id", "trace_da97", "request_id", "11daea38"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("应删掉 %s，实际 %s", leak, out)
 		}
@@ -176,7 +176,8 @@ func TestBodyDropsEngineMetadata(t *testing.T) {
 	s := New("https://tokenrhythm.studio")
 	in := `{"id":"chatcmpl-1","metadata":{"weight_version":"default","weight_versions":[{"start":0,"end":1,"version":"default"}]},"usage":{"total_tokens":14}}`
 	out := string(s.Body([]byte(in)))
-	for _, leak := range []string{"weight_version", "weight_versions", "default"} {
+	// 洗空的嵌套对象要连键一起删，别留个 "metadata":{} 提示这里原本有东西。
+	for _, leak := range []string{"weight_version", "weight_versions", "default", "metadata"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("应删掉引擎元信息 %s：%s", leak, out)
 		}

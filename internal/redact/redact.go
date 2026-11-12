@@ -24,7 +24,10 @@ import (
 // 这些键一旦出现在响应里，就等于告诉调用方"你背后是谁、你的成本是多少"。
 var dropKeys = map[string]bool{
 	// 上游链路 ID：能直接拿去上游工单系统对账，也能反查"这单从哪个渠道出的"。
+	// request_id 同理——Anthropic 兼容端点把它塞进了 body（官方是响应头）。
+	// 客户端报障用网关自己的 X-Request-Id 就够了，日志里有完整映射。
 	"trace_id": true, "traceId": true, "traceID": true, "trace_id_hex": true,
+	"request_id": true,
 
 	// 上游结算字段：cost_cny 是这笔请求在上游的真实扣费，即进货价。
 	"cost_cny": true, "billing_pending": true, "billing": true,
@@ -171,7 +174,13 @@ func (s *Scrubber) walk(v any) (any, bool) {
 				continue
 			}
 			if nv, c := s.walk(val); c {
-				t[k] = nv
+				// 洗空的嵌套对象连键一起删：`"metadata":{}` 比没有更显眼，
+				// 等于告诉客户端"这里原本有东西，被拿掉了"。
+				if m, ok := nv.(map[string]any); ok && len(m) == 0 {
+					delete(t, k)
+				} else {
+					t[k] = nv
+				}
 				changed = true
 			}
 		}
