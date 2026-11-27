@@ -189,9 +189,30 @@ type PoolConfig struct {
 	// 单次请求最多换多少个号
 	RetryMax int `json:"retry_max"`
 
-	// 上游单请求超时（视频接口另算）
+	// 上游单请求超时（视频接口另算）。这是**单跳**上限，不是整个请求的上限。
 	UpstreamTimeout Duration `json:"upstream_timeout"`
 	VideoTimeout    Duration `json:"video_timeout"`
+
+	// 超时重试的"尾巴"：单跳超时后，整个请求还允许再花多久去重试一次。
+	//
+	// 为什么需要它：没有这个值，3 次重试 × 300s = 客户端等 15 分钟，
+	// 而它早在 60s 就断了。设了之后每次重试的 ctx = min(单跳上限, 剩余预算)。
+	//
+	// 为什么默认 30s 而不是 0：实测换号重发同一个 prompt 经常几百毫秒就返回
+	// 完整结果——上游其实已经算完，只是响应没回来（prompt cache 命中）。
+	// 30s 足够捞回这一类，又不至于让客户端干等。
+	// 0 = 超时不再重试（首跳用满就返回 504）。
+	RetryReserve Duration `json:"retry_reserve"`
+
+	// 流式的两段判活，取代"总时长"。
+	//
+	// 总时长对长回答是错的：一旦首字节到达，上游就在正常生成，按总时长掐断
+	// 只会得到"状态码 200 已发出 + 输出被截断 + usage 拿不到"，客户端拿到
+	// 残缺流，我们把这一轮 token 记成 0（上游照扣）。
+	//   StreamTTFB: 等响应头的上限（上游排队/未开始生成）
+	//   StreamIdle: 出字之后两帧之间最多等多久（上游卡死才触发）
+	StreamTTFB Duration `json:"stream_ttfb"`
+	StreamIdle Duration `json:"stream_idle"`
 
 	// 视频任务 ID → key 的粘性保留时长
 	StickyTTL Duration `json:"sticky_ttl"`
@@ -323,6 +344,9 @@ func Default() Config {
 			RetryMax:          3,
 			UpstreamTimeout:   Duration(300 * time.Second),
 			VideoTimeout:      Duration(600 * time.Second),
+			RetryReserve:      Duration(30 * time.Second),
+			StreamTTFB:        Duration(60 * time.Second),
+			StreamIdle:        Duration(120 * time.Second),
 			StickyTTL:         Duration(72 * time.Hour),
 			LeastInflight:     true,
 			InflightPenalty:   3,
@@ -488,6 +512,16 @@ func (c *Config) normalize() {
 	}
 	if p.VideoTimeout.Duration() <= 0 {
 		p.VideoTimeout = Duration(600 * time.Second)
+	}
+	// 0 是合法值（关掉超时重试），只有负数才当"没配"兜底。
+	if p.RetryReserve.Duration() < 0 {
+		p.RetryReserve = Duration(30 * time.Second)
+	}
+	if p.StreamTTFB.Duration() <= 0 {
+		p.StreamTTFB = Duration(60 * time.Second)
+	}
+	if p.StreamIdle.Duration() <= 0 {
+		p.StreamIdle = Duration(120 * time.Second)
 	}
 	if p.StickyTTL.Duration() <= 0 {
 		p.StickyTTL = Duration(72 * time.Hour)

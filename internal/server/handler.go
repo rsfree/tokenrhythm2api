@@ -33,6 +33,10 @@ const (
 	sameKeyPause      = 150 * time.Millisecond
 )
 
+// minAttemptBudget 是"还值得再发起一跳"的门槛。低于它就别试了：一次上游
+// 调用至少也要几百毫秒才可能拿到响应，发出去只会多记一次失败、多等一个退避。
+const minAttemptBudget = 5 * time.Second
+
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
@@ -125,7 +129,33 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// 实际用掉的尝试次数：全池失败时日志里要记真实值，不是 retry_max。
 	used := 0
 
+	// 单跳上限 vs 整个请求的预算。
+	//
+	// 老实现每次 attempt 都重新给满 upstream_timeout，且没有总上限：
+	// retry_max=3 就是 3×300s=900s，客户端早在 60s 就断了，我们还在为它等
+	// 第 2、3 跳（实测一条请求 620s 才返回 504）。
+	//
+	// 现在每次 attempt 的 ctx = min(单跳上限, 剩余预算)，预算耗尽直接放弃。
+	// 流式不参与总预算：它靠"有没有出字"判活，用总时长卡它只会截断正常的长回答。
+	hopCap := s.timeoutFor(isVideoCreate || isVideoQuery)
+	budget := hopCap
+	if !stream {
+		budget = hopCap + pcfg.RetryReserve.Duration()
+	}
+	// 重试门槛跟着单跳上限走：固定 5s 对 300s 的预算合适，但单跳本身只有
+	// 几百毫秒时（窄预算配置）会把所有重试都挡掉，所以按 1/5 封顶。
+	retryFloor := min(minAttemptBudget, hopCap/5)
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		remaining := budget - time.Since(start)
+		// 首跳只要还有预算就发；重试才要求剩余够一次真实调用，否则发出去
+		// 只会多记一次失败、多等一个退避。
+		//
+		// 检查必须在 Acquire 之前：先抢租约再发现没预算，等于白占一个号的
+		// inflight 名额，还会让它在选号里被降权。
+		if remaining <= 0 || (attempt > 1 && remaining < retryFloor) {
+			break
+		}
 		used = attempt
 		lease, err := s.d.Pool.Acquire(pool.PickRequest{
 			Model:       model,
@@ -167,11 +197,40 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		lastKey = lease.KeyID
 
-		ctx, cancel := context.WithTimeout(r.Context(), s.timeoutFor(isVideoCreate || isVideoQuery))
+		var (
+			ctx    context.Context
+			cancel context.CancelFunc
+			guard  *streamGuard
+		)
+		if stream {
+			// 流式：不给总超时。首字节之后上游出字慢是正常的（长回答），
+			// 按总时长掐断只会得到残缺流 + 拿不到 usage。
+			ctx, cancel = context.WithCancel(r.Context())
+			guard = newStreamGuard(cancel, pcfg.StreamTTFB.Duration(), pcfg.StreamIdle.Duration())
+		} else {
+			hop := hopCap
+			if remaining := budget - time.Since(start); remaining < hop {
+				hop = remaining
+			}
+			ctx, cancel = context.WithTimeout(r.Context(), hop)
+		}
 		res, err := s.d.Up.Do(ctx, r.Method, path, body, lease.Secret, r.Header, stream)
 		if err != nil {
+			if guard != nil {
+				guard.Stop()
+			}
 			cancel()
 			v := fault.ClassifyNet(err)
+			if guard != nil && guard.Fired() {
+				// 我们掐断的，不是客户端断的。按 upstream_timeout 记才算"渠道病"，
+				// 也才会进异常面板；记成"客户端断开"等于把故障藏起来。
+				v = fault.Verdict{
+					Canonical: fault.CUpstreamTimeout,
+					Kind:      fault.Upstream,
+					RuleID:    "stream.head_timeout",
+					Message:   err.Error(),
+				}
+			}
 			s.d.Pool.Release(lease, pool.Outcome{
 				Kind: v.Kind, Model: model, Message: err.Error(),
 			})
@@ -228,7 +287,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		// 成功：从这里开始不能再换号。
 		s.stats.OK.Add(1)
-		s.deliver(w, r, res, lease, model, path, stream, attempt, start, isVideoCreate, reqID)
+		if guard != nil {
+			guard.Head() // 响应头到手，从"等首字节"切到"逐帧空闲"判活
+		}
+		s.deliver(w, r, res, lease, model, path, stream, attempt, start, isVideoCreate, reqID, guard)
 		cancel()
 		return
 	}
@@ -352,8 +414,11 @@ func (s *Server) timeoutFor(video bool) time.Duration {
 }
 
 // deliver 把已确认 2xx 的响应交给客户端，并同步记账。
+//
+// guard 只在流式路径上非空：它负责"出字后卡住"的判活，并把中断归因说清楚。
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.Result, lease *pool.Lease,
-	model, path string, stream bool, attempt int, start time.Time, isVideoCreate bool, reqID string) {
+	model, path string, stream bool, attempt int, start time.Time, isVideoCreate bool, reqID string,
+	guard *streamGuard) {
 
 	entry := reqlog.Entry{
 		Time: time.Now(), RequestID: reqID,
@@ -365,11 +430,14 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 
 	if res.Stream != nil {
 		defer res.Close()
+		if guard != nil {
+			defer guard.Stop()
+		}
 		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, werr := s.pipeSSE(sw, res.Stream, r, reqID, true, start)
+		u, ttfb, werr := s.pipeSSE(sw, res.Stream, r, reqID, true, start, guard)
 		sw.Close()
 
 		entry.LatencyMS = time.Since(start).Milliseconds()
@@ -378,7 +446,17 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 		cost := s.d.Prices.Cost(model, u)
 		entry.Cost = cost
 		if werr != nil {
-			entry.Note = "客户端断开: " + werr.Error()
+			switch {
+			case guard != nil && guard.Fired():
+				// 我们掐断的：客户端拿到的是没有 [DONE] 的残缺流，usage 也没拿到，
+				// 这一轮成本只能记 0（上游照扣）。必须记 Error 而不是 Note——
+				// Note 不进异常面板，这类漏记账的故障会被彻底藏起来。
+				entry.Error = "流式" + guard.TimeoutWhy() + "，回答被截断且 usage 未取到: " + werr.Error()
+			case r.Context().Err() != nil:
+				entry.Note = "客户端断开: " + werr.Error()
+			default:
+				entry.Note = "读上游中断: " + werr.Error()
+			}
 		}
 		s.d.Pool.Record(lease.KeyID, u.Prompt, u.Completion, cost)
 		s.d.Pool.Release(lease, pool.Outcome{Model: model})
@@ -433,11 +511,36 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 	stream := meta.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 	tok, _ := httpauth.Credential(r)
 	isVideo := strings.Contains(r.URL.Path, "/videos")
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeoutFor(isVideo))
+	// 直连路径同样不能给流式设总时长：长回答被截断的后果与池化路径一样
+	// （客户端拿残缺流、usage 记 0），只是账单不经过我们。
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+		guard  *streamGuard
+	)
+	if stream {
+		ctx, cancel = context.WithCancel(r.Context())
+		pc := s.d.Pool.Config()
+		guard = newStreamGuard(cancel, pc.StreamTTFB.Duration(), pc.StreamIdle.Duration())
+	} else {
+		ctx, cancel = context.WithTimeout(r.Context(), s.timeoutFor(isVideo))
+	}
 	defer cancel()
+	defer func() {
+		if guard != nil {
+			guard.Stop()
+		}
+	}()
 
 	res, err := s.d.Up.Do(ctx, r.Method, r.URL.Path, body, tok, r.Header, stream)
 	if err != nil {
+		if guard != nil && guard.Fired() {
+			s.writeFault(w, r, reqID, fault.Verdict{
+				Canonical: fault.CUpstreamTimeout, Kind: fault.Upstream,
+				RuleID: "stream.head_timeout", Message: err.Error(),
+			}, "")
+			return
+		}
 		s.writeFault(w, r, reqID, fault.ClassifyNet(err), "")
 		return
 	}
@@ -461,15 +564,25 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 	}
 	if res.Stream != nil {
 		defer res.Close()
+		if guard != nil {
+			guard.Head()
+		}
 		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, _ := s.pipeSSE(sw, res.Stream, r, reqID, false, start)
+		u, ttfb, werr := s.pipeSSE(sw, res.Stream, r, reqID, false, start, guard)
 		sw.Close()
 		entry.LatencyMS = time.Since(start).Milliseconds()
 		entry.TTFBMS = ttfb
 		entry.PromptTokens, entry.CompletionTokens = u.Prompt, u.Completion
 		entry.Cost = s.d.Prices.Cost(meta.Model, u)
+		if werr != nil {
+			if guard != nil && guard.Fired() {
+				entry.Error = "流式" + guard.TimeoutWhy() + "，回答被截断且 usage 未取到: " + werr.Error()
+			} else {
+				entry.Note = "流式中断: " + werr.Error()
+			}
+		}
 	} else {
 		u, _ := usage.Parse(res.Body)
 		copyResponseHeaders(w, res.Header, false)

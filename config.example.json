@@ -39,6 +39,9 @@
     "retry_max": 3,
     "upstream_timeout": "300s",
     "video_timeout": "600s",
+    "retry_reserve": "30s",
+    "stream_ttfb": "60s",
+    "stream_idle": "120s",
     "sticky_ttl": "72h",
 
     "least_inflight": true,

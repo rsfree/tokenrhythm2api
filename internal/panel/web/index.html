@@ -305,6 +305,10 @@
               <label>闲置权重 / 小时<input type="number" id="pIdle" step="0.1" min="0"></label>
               <label>429 冷却（秒）<input type="number" id="pRate" min="1"></label>
               <label>熔断冷却（秒）<input type="number" id="pBreaker" min="1"></label>
+              <label>上游单跳超时（秒）<input type="number" id="pUpTimeout" min="5"></label>
+              <label>超时重试尾巴（秒）<input type="number" id="pRetryReserve" min="0"></label>
+              <label>流式首字节（秒）<input type="number" id="pStreamTTFB" min="5"></label>
+              <label>流式空闲（秒）<input type="number" id="pStreamIdle" min="5"></label>
               <label>在途惩罚系数<input type="number" id="pInflight" step="0.5" min="0"></label>
               <label>会话粘性
                 <select id="pSticky"><option value="1">开启（保 prompt cache）</option><option value="0">关闭（纯分摊）</option></select>

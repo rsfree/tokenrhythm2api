@@ -681,6 +681,10 @@ function fillPoolForm(p) {
   $('pIdle').value = p.idle_weight_per_hour ?? 0;
   $('pRate').value = Math.round(parseDur(p.rate_cooldown));
   $('pBreaker').value = Math.round(parseDur(p.breaker_cooldown));
+  $('pUpTimeout').value = Math.round(parseDur(p.upstream_timeout)) || 300;
+  $('pRetryReserve').value = Math.max(0, Math.round(parseDur(p.retry_reserve)) || 0);
+  $('pStreamTTFB').value = Math.round(parseDur(p.stream_ttfb)) || 60;
+  $('pStreamIdle').value = Math.round(parseDur(p.stream_idle)) || 120;
   $('pInflight').value = p.inflight_penalty ?? 3;
   const ss = p.session_sticky || {};
   $('pSticky').value = ss.enabled ? '1' : '0';
@@ -1033,6 +1037,11 @@ $('btnSavePool').addEventListener('click', async () => {
     idle_weight_per_hour: parseFloat($('pIdle').value) || 0,
     rate_cooldown: Math.round(parseFloat($('pRate').value) || 20) + 's',
     breaker_cooldown: Math.round(parseFloat($('pBreaker').value) || 30) + 's',
+    upstream_timeout: Math.max(5, parseInt($('pUpTimeout').value, 10) || 300) + 's',
+    // 0 是合法值：关掉超时重试。别用 || 兜底，那会把 0 变成 30。
+    retry_reserve: Math.max(0, parseInt($('pRetryReserve').value, 10) || 0) + 's',
+    stream_ttfb: Math.max(5, parseInt($('pStreamTTFB').value, 10) || 60) + 's',
+    stream_idle: Math.max(5, parseInt($('pStreamIdle').value, 10) || 120) + 's',
     inflight_penalty: parseFloat($('pInflight').value) || 3,
     session_sticky: {
       ...(base.session_sticky || {}),

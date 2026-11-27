@@ -116,13 +116,19 @@ func (s *streamWriter) Close() {
 // canonicalize 为真时，流里的 error 帧会换成我们自己的 canonical 文案：
 // 一旦发过 200 就改不了状态码，只能靠这一帧告诉客户端"这一轮失败了"，
 // 而它同样是泄露口——上游会把 traceId、余额、充值链接写在这个帧里。
-func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, r *http.Request, reqID string, canonicalize bool, start time.Time) (usage.Usage, int64, error) {
+//
+// guard 非空时，每读到一帧就续一次空闲预算。流式不设总时长正是靠这个：
+// 只要上游还在吐数据，跑多久都算正常。
+func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, r *http.Request, reqID string, canonicalize bool, start time.Time, guard *streamGuard) (usage.Usage, int64, error) {
 	br := bufio.NewReaderSize(src, 64<<10)
 	var u usage.Usage
 	ttfb := int64(-1)
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
+			if guard != nil {
+				guard.Touch()
+			}
 			// 顺序不能换：scanUsageLine 要靠 cost_cny 这一帧记账，
 			// 先脱敏的话那个字段已经没了，成本会全部记成 0。
 			scanUsageLine(line, &u)
