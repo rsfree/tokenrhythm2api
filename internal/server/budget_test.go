@@ -250,13 +250,23 @@ func TestClientDisconnectStaysNote(t *testing.T) {
 	cancel()
 	_ = resp.Body.Close()
 
-	// 等 handler 收尾记账。
+	// 等 handler 收尾记账。判据只能是"记录已存在"：这里整个请求在 1ms 内
+	// 就结束了，LatencyMS 用 Milliseconds() 截断后是 0。老写法要求
+	// LatencyMS > 0 才认记录，在 Linux（纳秒时钟、截断成 0）上必然等空
+	// 2s 判失败；Windows 时钟精度 15.6ms 反而侥幸通过——所以这个 bug
+	// 只在 CI 里现形。
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		logs := h.log.Recent(1)
-		if len(logs) == 1 && logs[0].LatencyMS > 0 {
-			if logs[0].Error != "" {
-				t.Fatalf("客户端断开不该记 Error，实际 %q", logs[0].Error)
+		if len(logs) == 1 {
+			e := logs[0]
+			if e.Error != "" {
+				t.Fatalf("客户端断开不该记 Error，实际 %q", e.Error)
+			}
+			// 必须是"记了 Note"而不是"什么都没记"：漏记和错记一样是缺陷，
+			// 只断言 Error 为空的话，归因整段被删掉也能过。
+			if !strings.Contains(e.Note, "客户端断开") {
+				t.Fatalf("客户端断开应记 Note，实际 %q", e.Note)
 			}
 			return
 		}
