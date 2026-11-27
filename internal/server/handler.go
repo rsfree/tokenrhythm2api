@@ -122,8 +122,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// 同一个号上的渠道病重试次数，换号后清零。
 	sameKeyRetries := 0
 	lastKey := ""
+	// 实际用掉的尝试次数：全池失败时日志里要记真实值，不是 retry_max。
+	used := 0
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		used = attempt
 		lease, err := s.d.Pool.Acquire(pool.PickRequest{
 			Model:       model,
 			Paid:        paid,
@@ -236,7 +239,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		final = fault.Verdict{Canonical: fault.CUnknown, Kind: fault.Upstream, RuleID: "pool.no_attempt"}
 	}
-	s.noteFailure(r, reqID, nil, model, path, final, maxAttempts, start, "", summarize(failures))
+	s.noteFailure(r, reqID, nil, model, path, final, used, start, "", summarize(failures))
 	s.writeFault(w, r, reqID, final, "")
 	s.d.Daily.Add(time.Now(), 0, 0, 0, true)
 }

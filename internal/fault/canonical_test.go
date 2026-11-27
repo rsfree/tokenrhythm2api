@@ -84,6 +84,13 @@ func TestStatusIsNotSemantics(t *testing.T) {
 			CModelNotFound, 404, Client,
 		},
 		{
+			// /v1/messages 那条路径上游只回一句中文、没有 code：
+			// 靠窄 hint 判成"模型不存在"，别再笼统算成请求参数错。
+			"400 模型不可用（无 code）",
+			400, `{"error":{"message":"模型不可用：no-such-model"}}`,
+			CModelNotFound, 404, Client,
+		},
+		{
 			"400 上下文超长",
 			400, `{"error":{"message":"This model's maximum context length is 8192 tokens"}}`,
 			CContextLength, 400, Client,

@@ -174,6 +174,13 @@ var hints = map[string][]string{
 		"content policy", "content management policy", "sensitive", "moderation",
 		"flagged", "审核", "敏感",
 	},
+	// 只放"模型不存在/未开通"的窄说法：`model`、`not available` 这类宽泛词会
+	// 把限流和过载的文案也吸进来，那是另一种结论。
+	"model": {
+		"模型不可用", "模型不存在", "模型未开通", "不支持该模型",
+		"model not found", "model not available", "no such model",
+		"model does not exist", "model_not_available", "invalid model",
+	},
 }
 
 // Rule 是一条判定规则。字段之间是 AND，同一字段内是 OR。
@@ -273,6 +280,7 @@ var genericRules = []Rule{
 	{ID: "generic.404", Status: []int{404}, Canonical: CModelNotFound},
 	{ID: "generic.413", Status: []int{413}, Canonical: CRequestTooLarge},
 	{ID: "generic.422", Status: []int{422}, Canonical: CInvalidRequest},
+	{ID: "generic.400_model", Status: []int{400, 404}, Hints: []string{"model"}, Canonical: CModelNotFound},
 	{ID: "generic.400_context", Status: []int{400}, Hints: []string{"context"}, Canonical: CContextLength},
 	{ID: "generic.400_content", Status: []int{400}, Hints: []string{"content"}, Canonical: CContentPolicy},
 	{ID: "generic.400", Status: []int{400}, Canonical: CInvalidRequest},
