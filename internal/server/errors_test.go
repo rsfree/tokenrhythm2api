@@ -126,3 +126,31 @@ func TestSuccessWithErrorBodyIsFailure(t *testing.T) {
 		}
 	}
 }
+
+// /v1/messages 的客户端是 Anthropic SDK：它按外层 type 认错误帧，
+// 套 OpenAI 的形状会在解析阶段抛协议错。字段一致，只是多包一层。
+func TestAnthropicEnvelopeForMessages(t *testing.T) {
+	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"max_tokens is required"}}`)
+	}
+	req := `{"model":"glm-5.1","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`
+	resp, body := h.do(t, http.MethodPost, "/v1/messages", req, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("应回 400，实际 %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("Anthropic 信封应有外层 type=error，实际 %s", body)
+	}
+	if !strings.Contains(body, `"code":"invalid_request_error"`) {
+		t.Fatalf("内层仍应是 canonical code，实际 %s", body)
+	}
+	// OpenAI 路径不能带外层 type（那是 Anthropic 专有形状）。
+	h2 := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
+	h2.fk.behave = h.fk.behave
+	_, body2 := h2.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
+	if strings.Contains(body2, `"type":"error"`) {
+		t.Fatalf("OpenAI 路径不该套 Anthropic 信封，实际 %s", body2)
+	}
+}

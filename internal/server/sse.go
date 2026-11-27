@@ -116,7 +116,7 @@ func (s *streamWriter) Close() {
 // canonicalize 为真时，流里的 error 帧会换成我们自己的 canonical 文案：
 // 一旦发过 200 就改不了状态码，只能靠这一帧告诉客户端"这一轮失败了"，
 // 而它同样是泄露口——上游会把 traceId、余额、充值链接写在这个帧里。
-func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, reqID string, canonicalize bool, start time.Time) (usage.Usage, int64, error) {
+func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, r *http.Request, reqID string, canonicalize bool, start time.Time) (usage.Usage, int64, error) {
 	br := bufio.NewReaderSize(src, 64<<10)
 	var u usage.Usage
 	ttfb := int64(-1)
@@ -128,7 +128,7 @@ func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, reqID string, canonica
 			scanUsageLine(line, &u)
 			out := s.scrub.SSELine(line)
 			if canonicalize {
-				out = s.sseErrorFrame(line, out, reqID)
+				out = s.sseErrorFrame(line, out, r, reqID)
 			}
 			if _, werr := sw.Write(out); werr != nil {
 				return u, ttfb, werr // 客户端断了，别再往上游要数据
@@ -150,7 +150,7 @@ func (s *Server) pipeSSE(sw *streamWriter, src io.Reader, reqID string, canonica
 //
 // 只换 data 行，不动 event 行与空行——上游若发 `event: error` + `data: {...}`，
 // 两行拼起来才是完整的一帧，多插/少插空行都会破坏帧边界。
-func (s *Server) sseErrorFrame(raw, scrubbed []byte, reqID string) []byte {
+func (s *Server) sseErrorFrame(raw, scrubbed []byte, r *http.Request, reqID string) []byte {
 	t := bytes.TrimSpace(raw)
 	if !bytes.HasPrefix(t, []byte("data:")) {
 		return scrubbed
@@ -163,7 +163,7 @@ func (s *Server) sseErrorFrame(raw, scrubbed []byte, reqID string) []byte {
 		return scrubbed
 	}
 	v := fault.Classify(http.StatusOK, payload, nil)
-	body := faultBody(v.Canonical, v.Type(), v.CallerMessage(reqID), reqID)
+	body := faultBody(pathOf(r), v.Canonical, v.Type(), v.CallerMessage(reqID), reqID)
 	eol := "\n"
 	if bytes.HasSuffix(raw, []byte("\r\n")) {
 		eol = "\r\n"

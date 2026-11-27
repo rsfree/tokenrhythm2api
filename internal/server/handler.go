@@ -50,7 +50,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.stats.Failed.Add(1)
 		// 这是**我方**的鉴权，不是上游凭据问题：文案必须点明该用哪把 key，
 		// 否则调用方会拿面板令牌/上游 key 一直重试。
-		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CAuthentication},
+		s.writeFault(w, r, reqID, fault.Verdict{Canonical: fault.CAuthentication},
 			"网关密钥无效；请使用面板下发的 client key")
 		return
 	}
@@ -62,14 +62,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		s.stats.Failed.Add(1)
-		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CInvalidRequest},
+		s.writeFault(w, r, reqID, fault.Verdict{Canonical: fault.CInvalidRequest},
 			"读取请求体失败，请重试")
 		return
 	}
 	_ = r.Body.Close()
 	if int64(len(body)) > limit {
 		s.stats.Failed.Add(1)
-		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CRequestTooLarge}, "")
+		s.writeFault(w, r, reqID, fault.Verdict{Canonical: fault.CRequestTooLarge}, "")
 		return
 	}
 
@@ -145,7 +145,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 				s.stats.Failed.Add(1)
 				s.noteFailure(r, reqID, nil, model, path, v, attempt, start, "", err.Error())
-				s.writeFault(w, reqID, v, "")
+				s.writeFault(w, r, reqID, v, "")
 				s.d.Daily.Add(time.Now(), 0, 0, 0, true)
 				return
 			}
@@ -237,7 +237,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		final = fault.Verdict{Canonical: fault.CUnknown, Kind: fault.Upstream, RuleID: "pool.no_attempt"}
 	}
 	s.noteFailure(r, reqID, nil, model, path, final, maxAttempts, start, "", summarize(failures))
-	s.writeFault(w, reqID, final, "")
+	s.writeFault(w, r, reqID, final, "")
 	s.d.Daily.Add(time.Now(), 0, 0, 0, true)
 }
 
@@ -292,7 +292,7 @@ func summarize(vs []fault.Verdict) string {
 //
 // message 参数只允许放**我方**自己写的话（例如"网关密钥无效"），
 // 任何来自上游的字符串都不许从这里经过。
-func (s *Server) writeFault(w http.ResponseWriter, reqID string, v fault.Verdict, message string) {
+func (s *Server) writeFault(w http.ResponseWriter, r *http.Request, reqID string, v fault.Verdict, message string) {
 	sp := fault.SpecOf(v.Canonical)
 	if message == "" {
 		message = fault.Message(v.Canonical, int(v.RetryAfter/time.Second), reqID)
@@ -309,18 +309,33 @@ func (s *Server) writeFault(w http.ResponseWriter, reqID string, v fault.Verdict
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(sp.HTTP)
-	_, _ = w.Write(faultBody(v.Canonical, sp.Type, message, reqID))
+	_, _ = w.Write(faultBody(pathOf(r), v.Canonical, sp.Type, message, reqID))
 }
 
-func faultBody(code fault.Canonical, typ, message, reqID string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"message":    message,
-			"type":       typ,
-			"code":       string(code),
-			"request_id": reqID,
-		},
-	})
+func pathOf(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return r.URL.Path
+}
+
+// faultBody 生成对外错误体：只有 message / type / code / request_id 四个字段。
+//
+// /v1/messages 走 Anthropic 信封（`{"type":"error","error":{…}}`）：Anthropic 的
+// SDK 按外层 type 认错误帧，套 OpenAI 的形状会让它在流式解析时抛协议错。
+// 内层字段与 OpenAI 完全一致，只是多包一层。
+func faultBody(path string, code fault.Canonical, typ, message, reqID string) []byte {
+	inner := map[string]any{
+		"message":    message,
+		"type":       typ,
+		"code":       string(code),
+		"request_id": reqID,
+	}
+	body := map[string]any{"error": inner}
+	if strings.Contains(path, "/messages") {
+		body["type"] = "error"
+	}
+	b, _ := json.Marshal(body)
 	return b
 }
 
@@ -351,7 +366,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 		w.WriteHeader(res.Status)
 
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, werr := s.pipeSSE(sw, res.Stream, reqID, true, start)
+		u, ttfb, werr := s.pipeSSE(sw, res.Stream, r, reqID, true, start)
 		sw.Close()
 
 		entry.LatencyMS = time.Since(start).Milliseconds()
@@ -420,7 +435,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 
 	res, err := s.d.Up.Do(ctx, r.Method, r.URL.Path, body, tok, r.Header, stream)
 	if err != nil {
-		s.writeFault(w, reqID, fault.ClassifyNet(err), "")
+		s.writeFault(w, r, reqID, fault.ClassifyNet(err), "")
 		return
 	}
 	if res.Status >= 400 {
@@ -446,7 +461,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, _ := s.pipeSSE(sw, res.Stream, reqID, false, start)
+		u, ttfb, _ := s.pipeSSE(sw, res.Stream, r, reqID, false, start)
 		sw.Close()
 		entry.LatencyMS = time.Since(start).Milliseconds()
 		entry.TTFBMS = ttfb

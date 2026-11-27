@@ -499,6 +499,9 @@ provider 业务码 → 厂商 code/type → message hint（受控词表）→ st
   "message":"服务方额度已用尽，在服务方充值前重试无效","request_id":"5cd76eaadd9215181ef25c17970217dc"}}
 ```
 
+`/v1/messages` 的客户端是 Anthropic SDK，它按外层 `type` 认错误体，所以这条路径多包一层
+`{"type":"error","error":{…}}`（内层字段与上面完全一致）。
+
 上游原文（`INSUFFICIENT_BALANCE`、`https://<上游>/account/recharge`、`traceId`、
 "账户余额不足"）一个字都不出去——不是"过滤后透传"，是**不透传**：正则拦得住邮箱和 JWT，
 拦不住"你本月还剩 3 次"这种纯数字句子。运维侧同一行里留住两个视图：
