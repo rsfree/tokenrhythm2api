@@ -107,6 +107,11 @@ docker run -d --name trpool --restart unless-stopped \
 
 > 镜像 tag 与 git tag 同版本但**不带 `v` 前缀**（`v0.0.4` → `:0.0.4`），另有 `:latest` 和 `:sha-<7位>`，
 > 三者来自同一次构建（digest 相同）。当前只构建 **linux/amd64**。
+>
+> 镜像带 OCI 标签，可反查构建来源：`docker image inspect <image> --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'`。
+
+**生产部署（反代、升级回滚、排障、安全清单）见 [`DEPLOY.md`](DEPLOY.md)**；
+宿主机 nginx 配置与四个不能改错的设置见 [`deploy/nginx/README.md`](deploy/nginx/README.md)。
 
 ---
 

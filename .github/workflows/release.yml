@@ -179,6 +179,7 @@ jobs:
           # 三个 tag 必须来自同一次 build，否则 digest 会不同
           docker build \
             --build-arg VERSION='${{ needs.release.outputs.version }}' \
+            --build-arg REVISION='${{ github.sha }}' \
             -t "${IMAGE}:${{ steps.tag.outputs.value }}" \
             -t "${IMAGE}:latest" \
             -t "${IMAGE}:sha-${{ steps.tag.outputs.short }}" .

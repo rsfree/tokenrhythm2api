@@ -1,0 +1,32 @@
+services:
+  trpool:
+    # 不给默认值：老版本写的是 `:-0.0.6`，.env 里这个键被误删时会静默拉起三个月前
+    # 的镜像（那版还在透传上游 body、错误码还是 NO_CAPACITY），日志里看不出任何异常。
+    image: ghcr.io/rsfree/tokenrhythm2api:${TRPOOL_IMAGE_TAG:?请在 .env 里给 TRPOOL_IMAGE_TAG}
+    container_name: trpool
+    restart: unless-stopped
+    # 镜像内就是 uid 10001；显式写出来，宿主目录忘 chown 时也不会变成 root 写文件
+    user: "10001:10001"
+    # 仓库默认 config 路径是 WORKDIR(/data) 下的 config.json，改用 conf 目录挂载，
+    # 见 volumes 注释：绑单文件时面板的"写回"会 EBUSY
+    command: ["-config", "/data/conf/config.json", "-data", "/data/data"]
+    ports:
+      # 🔴 只绑回环。ai-prod 的 ufw 放行 39000-40000 整段，
+      #    绑 0.0.0.0 = 把一个能烧上游额度的网关裸到公网。公网入口一律 nginx + trpool.1task.cn
+      - "127.0.0.1:39310:8787"
+    environment:
+      TRPOOL_ADMIN_KEY: ${TRPOOL_ADMIN_KEY:?请在 .env 里给 TRPOOL_ADMIN_KEY}
+      TRPOOL_CLIENT_KEYS: ${TRPOOL_CLIENT_KEYS:?请在 .env 里给 TRPOOL_CLIENT_KEYS}
+      TRPOOL_UPSTREAM: ${TRPOOL_UPSTREAM:-https://tokenrhythm.studio}
+      TZ: Asia/Shanghai
+    volumes:
+      # 挂**目录**而不是单文件 Δ①：面板"策略热更新"写回是 tmp + rename，
+      # rename 到 bind mount 的挂载点上会 EBUSY（写回被静默吞掉，重启即丢配置）
+      - ./conf:/data/conf
+      # 号池状态 + 账本 + 粘性表；丢了会重新记账
+      - ./data:/data/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
