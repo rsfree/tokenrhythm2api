@@ -34,7 +34,7 @@ func TestClassify(t *testing.T) {
 		{"403 insufficient", 403, `{"code":"INSUFFICIENT_BALANCE","message":"账户余额不足"}`, Quota, true, false},
 		{"400 insufficient", 400, `{"code":"INSUFFICIENT_BALANCE"}`, Quota, true, false},
 		{"403 model denied", 403, `{"code":"MODEL_ACCESS_DENIED"}`, ModelDenied, true, true},
-		{"403 unknown", 403, `{"code":"WHATEVER"}`, Quota, true, false},
+		{"403 unknown", 403, `{"code":"WHATEVER"}`, ModelDenied, true, true},
 		{"500", 500, `oops`, Upstream, true, false},
 		{"400", 400, `{"error":"bad"}`, Client, false, false},
 		{"200", 200, `{}`, None, false, false},

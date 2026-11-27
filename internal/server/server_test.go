@@ -206,23 +206,25 @@ func TestRetryOn5xxSwitchesKey(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("应换号成功，实际 %d %s", resp.StatusCode, body)
 	}
-	if got := h.fk.count(); got != 2 {
-		t.Fatalf("应打两次上游（A 失败 + B 成功），实际 %d", got)
+	// 渠道病（5xx）先在同一个号上重试一次，再换号：瞬时抖动换号救不了，
+	// 反而把新号也拖进熔断统计。
+	if got := h.fk.count(); got != 3 {
+		t.Fatalf("应为 A 失败 → A 重试 → B 成功，实际 %d 次", got)
 	}
-	if st := h.srv.Stats().Snapshot(); st["retries"] != 1 || st["switched"] != 1 {
+	if st := h.srv.Stats().Snapshot(); st["retries"] != 2 || st["switched"] != 1 {
 		t.Fatalf("重试统计不对: %+v", st)
 	}
 	hits := h.fk.hits()
-	if hits[0].secret != keyA || hits[1].secret != keyB {
-		t.Fatalf("应先在 A 失败再换 B，实际 %+v", hits)
+	if hits[0].secret != keyA || hits[1].secret != keyA || hits[2].secret != keyB {
+		t.Fatalf("应为 A → A → B，实际 %+v", hits)
 	}
 	if resp.Header.Get("X-Trpool-Attempt") != "" {
 		t.Fatalf("不应再回 X-Trpool-Attempt（渠道信息不外泄），实际 %q", resp.Header.Get("X-Trpool-Attempt"))
 	}
 	// 第几次尝试改由日志承载：面板上还能看到，客户端不再看得到。
 	logs := h.log.Recent(1)
-	if len(logs) != 1 || logs[0].Attempt != 2 {
-		t.Fatalf("日志里应记第 2 次尝试，实际 %+v", logs)
+	if len(logs) != 1 || logs[0].Attempt != 3 {
+		t.Fatalf("日志里应记第 3 次尝试，实际 %+v", logs)
 	}
 }
 
@@ -234,10 +236,18 @@ func TestClientErrorNoRetry(t *testing.T) {
 	}
 	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
 	if resp.StatusCode != 400 {
-		t.Fatalf("应透传 400，实际 %d", resp.StatusCode)
+		t.Fatalf("请求病应回 400，实际 %d", resp.StatusCode)
 	}
-	if !strings.Contains(body, "bad request") {
-		t.Fatalf("应保留上游原文，实际 %s", body)
+	if !strings.Contains(body, `"code":"invalid_request_error"`) {
+		t.Fatalf("对外 code 应为 invalid_request_error，实际 %s", body)
+	}
+	// 上游原话不再出现在响应里：文案由我们的模板生成。
+	if strings.Contains(body, "bad request") {
+		t.Fatalf("不该透传上游原文，实际 %s", body)
+	}
+	// 请求病换谁都一样：30 个号的池子就是 30 次无效调用 30 次计费。
+	if got := h.fk.count(); got != 1 {
+		t.Fatalf("请求病不该换号重试，实际打了 %d 次", got)
 	}
 	if h.fk.count() != 1 {
 		t.Fatalf("4xx 不该换号重试，上游被打了 %d 次", h.fk.count())
@@ -301,24 +311,39 @@ func TestRateLimitedCoolsKey(t *testing.T) {
 	}
 }
 
-func TestAllKeysFailPreservesUpstreamBody(t *testing.T) {
+// 全池 5xx：对外统一 api_error(500)。不保留上游的 502——502 在我们的契约里
+// 只表示"压根没拿到上游响应"，拿它当"上游 502"用会让调用方分不清两种情况。
+func TestAllKeysFailReturnsApiError(t *testing.T) {
 	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 2 })
 	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
 		w.WriteHeader(502)
 		_, _ = io.WriteString(w, `{"error":{"message":"upstream exploded"}}`)
 	}
 	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
-	if resp.StatusCode != 502 {
-		t.Fatalf("应保留上游 502，实际 %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("上游 5xx 应归一为 api_error(500)，实际 %d %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "upstream exploded") {
-		t.Fatalf("应保留上游原文，实际 %s", body)
+	if !strings.Contains(body, `"code":"api_error"`) {
+		t.Fatalf("对外 code 应为 api_error，实际 %s", body)
+	}
+	if strings.Contains(body, "upstream exploded") {
+		t.Fatalf("不该透传上游原文，实际 %s", body)
 	}
 	if c := h.fk.count(); c != 2 {
-		t.Fatalf("两次尝试后应放弃，实际 %d 次", c)
+		t.Fatalf("两次尝试后应放弃（A 重试一次后到上限），实际 %d 次", c)
 	}
 	if h.srv.Stats().Snapshot()["failed"] != 1 {
 		t.Fatal("失败计数未增加")
+	}
+	// 运维视图要留住上游原文。
+	var raw string
+	for _, e := range h.log.Recent(10) {
+		if strings.Contains(e.RawMessage, "upstream exploded") {
+			raw = e.RawMessage
+		}
+	}
+	if raw == "" {
+		t.Fatalf("日志丢了上游原文，实际 %+v", h.log.Recent(10))
 	}
 }
 
@@ -466,38 +491,42 @@ func TestPassthroughMode(t *testing.T) {
 	}
 }
 
-func TestAllKeysDeadReturns503(t *testing.T) {
+func TestAllKeysDeadReturnsQuota(t *testing.T) {
 	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 2 })
 	h.fk.behave = func(w http.ResponseWriter, r *http.Request, secret string, n int, body []byte) {
 		w.WriteHeader(402)
 		_, _ = io.WriteString(w, `{"code":"INSUFFICIENT_BALANCE","message":"账户余额不足"}`)
 	}
 	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("号全欠费应回 503，而不是把上游 402 透传给客户端，实际 %d %s", resp.StatusCode, body)
+	// 对外契约按 OpenAI 归一：欠费 = 429 + insufficient_quota（不是上游的 402，
+	// 也不是自造的 NO_CAPACITY）。code 明确告诉调用方"重试无效"。
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("全池欠费应对外 429 insufficient_quota，实际 %d %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "NO_CAPACITY") || !strings.Contains(body, "当前无可用容量") {
-		t.Fatalf("错误体应说清是网关侧没容量，实际 %s", body)
+	if !strings.Contains(body, `"code":"insufficient_quota"`) {
+		t.Fatalf("对外 code 应为 insufficient_quota，实际 %s", body)
 	}
-	// 池子规模、欠费/冻结分布都是内部经营数据，一个字都不该出现在给客户端的 body 里。
-	for _, leak := range []string{"欠费", "冻结", "池内共", "号池", "余额"} {
+	// 终态不给 Retry-After：给了时间等于说"等一会儿能恢复"。
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		t.Fatalf("insufficient_quota 不该带 Retry-After，实际 %q", ra)
+	}
+	// 池子规模、欠费/冻结分布、上游业务码都是内部信息，一个字都不该出现。
+	for _, leak := range []string{"欠费", "冻结", "池内共", "号池", "余额", "INSUFFICIENT_BALANCE", "账户"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("错误体泄露了渠道内部信息（%q），实际 %s", leak, body)
 		}
 	}
-	// 但面板/归档要能查到这一轮到底撞了什么。
-	logs := h.log.Recent(10)
-	var seen string
-	for _, e := range logs {
-		if strings.Contains(e.Error, "欠费 2") {
-			seen = e.Error
+	// 但面板/归档要能查到这一轮到底撞了什么（运维视图与对外视图是两套）。
+	var raw string
+	for _, e := range h.log.Recent(10) {
+		if e.Canonical == "insufficient_quota" && e.RawCode == "INSUFFICIENT_BALANCE" {
+			raw = e.RawCode
 		}
 	}
-	if seen == "" {
-		t.Fatalf("日志里应保留池子现状（欠费 2），实际 %+v", logs)
+	if raw == "" {
+		t.Fatalf("日志应保留上游原文与命中规则，实际 %+v", h.log.Recent(10))
 	}
 	// 不再回 X-Trpool-* 头：号名/尝试次数/上游 trace 都是渠道内部信息。
-	// 客户端靠 body 的 error.code 识别，排障靠面板日志。
 	for _, hk := range []string{"X-Trpool-Reason", "X-Trpool-Error", "X-Trpool-Key",
 		"X-Trpool-Attempt", "X-Trpool-Trace"} {
 		if v := resp.Header.Get(hk); v != "" {
@@ -523,13 +552,15 @@ func TestDeadRoundWithLiveKeysAsksRetry(t *testing.T) {
 		_, _ = io.WriteString(w, `{"code":"ACCOUNT_SUSPENDED","message":"账号已冻结"}`)
 	}
 	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("应回 503，实际 %d %s", resp.StatusCode, body)
+	// 账号被冻结属于"上游凭据不可用"：对外 401 authentication_error，
+	// 内部仍按终态 blocked 处理（两套视图分开）。
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("全池冻结应回 401 authentication_error，实际 %d %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(body, "请稍后重试") {
-		t.Fatalf("应提示稍后重试，实际 %s", body)
+	if !strings.Contains(body, `"code":"authentication_error"`) {
+		t.Fatalf("对外 code 应为 authentication_error，实际 %s", body)
 	}
-	for _, leak := range []string{"可用 1", "池内", "冻结", "本轮"} {
+	for _, leak := range []string{"可用 1", "池内", "冻结", "本轮", "ACCOUNT_SUSPENDED"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("不该对外描述池子状态（%q），实际 %s", leak, body)
 		}
@@ -566,8 +597,8 @@ func TestDailyCountsOnceDespiteRetries(t *testing.T) {
 	if reqs, _, _, _, _ := h.daily.Total(); reqs != 1 {
 		t.Fatalf("一次请求换号重试后日账仍应只记 1 次，实际 %d", reqs)
 	}
-	if len(h.log.Recent(10)) != 2 {
-		t.Fatalf("日志应保留两次尝试，实际 %d", len(h.log.Recent(10)))
+	if len(h.log.Recent(10)) != 3 {
+		t.Fatalf("日志应保留三次尝试（A 失败 → A 重试 → B 成功），实际 %d", len(h.log.Recent(10)))
 	}
 }
 
@@ -742,7 +773,8 @@ func TestStreamBodyRedacted(t *testing.T) {
 	}
 }
 
-// 失败时透传的是上游原话：4xx 里可能带着上游域名、文档链接和 traceId。
+// 失败时连上游原话都不透传：4xx 里的域名、文档链接、traceId 一个都不许出去，
+// 对外只有模板文案 + canonical code。
 func TestErrorBodyRedacted(t *testing.T) {
 	h := newHarness(t, func(c *config.PoolConfig) { c.RetryMax = 1 })
 	h.srv.scrub = redact.New("https://tokenrhythm.studio")
@@ -751,16 +783,18 @@ func TestErrorBodyRedacted(t *testing.T) {
 		_, _ = io.WriteString(w, `{"code":"MODEL_NOT_AVAILABLE","message":"模型不可用，详见 https://tokenrhythm.studio/docs/models","traceId":"trace_9e06b3c0"}`)
 	}
 	resp, body := h.do(t, http.MethodPost, "/v1/chat/completions", chatBody, nil)
-	if resp.StatusCode != 400 {
-		t.Fatalf("客户端错误应原样回 400，实际 %d %s", resp.StatusCode, body)
+	// 上游 400 + MODEL_NOT_AVAILABLE 语义是"模型不存在/未开通"→ 对外 404。
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("模型不存在应对外 404，实际 %d %s", resp.StatusCode, body)
 	}
-	for _, leak := range []string{"tokenrhythm", "traceId", "trace_9e06b3c0"} {
+	for _, leak := range []string{"tokenrhythm", "traceId", "trace_9e06b3c0",
+		"MODEL_NOT_AVAILABLE", "docs/models", "详见"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("错误体泄露了 %s：%s", leak, body)
 		}
 	}
-	// 错误码与 message 主体要留着，否则客户端没法判断是"模型不存在"还是"网关挂了"。
-	if !strings.Contains(body, "MODEL_NOT_AVAILABLE") || !strings.Contains(body, "模型不可用") {
+	// 但语义要留住，否则客户端没法判断是"模型不存在"还是"网关挂了"。
+	if !strings.Contains(body, `"code":"model_not_found"`) || !strings.Contains(body, "模型") {
 		t.Fatalf("错误语义不能被一起抹掉：%s", body)
 	}
 }
@@ -779,13 +813,19 @@ func TestNetworkErrorMessageHidesUpstream(t *testing.T) {
 			t.Fatalf("网络错误体泄露了 %s：%s", leak, body)
 		}
 	}
-	if !strings.Contains(body, "UPSTREAM_ERROR") {
-		t.Fatalf("应保留错误码：%s", body)
+	// 压根没拿到上游响应 → unknown_upstream_error（502），不是 5xx 渠道病。
+	if !strings.Contains(body, `"code":"unknown_upstream_error"`) {
+		t.Fatalf("应保留 canonical 错误码：%s", body)
 	}
-	// 细节不能丢，日志里要看得到真实原因。
-	logs := h.log.Recent(5)
-	if len(logs) == 0 || !strings.Contains(logs[0].Error, "连接上游失败") {
-		t.Fatalf("日志应保留原始网络错误，实际 %+v", logs)
+	// 细节不能丢，日志里要看得到真实原因（对外视图给结论，运维视图给原文）。
+	var raw string
+	for _, e := range h.log.Recent(5) {
+		if strings.Contains(e.RawMessage, "连接上游失败") {
+			raw = e.RawMessage
+		}
+	}
+	if raw == "" {
+		t.Fatalf("日志应保留原始网络错误，实际 %+v", h.log.Recent(5))
 	}
 }
 

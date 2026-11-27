@@ -3,11 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +26,13 @@ type reqMeta struct {
 	Stream bool   `json:"stream"`
 }
 
+// 渠道病（上游在抖）在同一账号上重试的次数与间隔。1 次足够区分"瞬时抖动"与
+// "真坏了"；间隔要短——这一跳的意义是"等一个抖动过去"，不是退避。
+const (
+	sameKeyRetryLimit = 1
+	sameKeyPause      = 150 * time.Millisecond
+)
+
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
@@ -42,7 +48,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	direct := snap.AllowPassthrough && strings.HasPrefix(tok, "sk_tr_")
 	if !direct && !httpauth.MatchAny(tok, snap.ClientKeys) {
 		s.stats.Failed.Add(1)
-		writeJSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", "网关密钥无效；请使用面板下发的 client key")
+		// 这是**我方**的鉴权，不是上游凭据问题：文案必须点明该用哪把 key，
+		// 否则调用方会拿面板令牌/上游 key 一直重试。
+		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CAuthentication},
+			"网关密钥无效；请使用面板下发的 client key")
 		return
 	}
 
@@ -53,13 +62,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		s.stats.Failed.Add(1)
-		writeJSONError(w, http.StatusBadRequest, "BAD_REQUEST", "读取请求体失败: "+err.Error())
+		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CInvalidRequest},
+			"读取请求体失败，请重试")
 		return
 	}
 	_ = r.Body.Close()
 	if int64(len(body)) > limit {
 		s.stats.Failed.Add(1)
-		writeJSONError(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "请求体超过上限")
+		s.writeFault(w, reqID, fault.Verdict{Canonical: fault.CRequestTooLarge}, "")
 		return
 	}
 
@@ -102,20 +112,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	preferKey := "" // 模型侧限流时"还是这个号再试一次"
-	lastKey := ""
 	maxAttempts := pcfg.RetryMax
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 
-	var lastBody []byte
-	var lastStatus int
-	var lastErr string
-	// 失败也要把 Retry-After 这类语义头带出去（429 的退避全靠它），
-	// 但只带白名单里的，上游其余头一个不放。
-	var lastHeader http.Header
-	// 每次失败尝试的归类：用来判断"这一整轮是不是号都欠费/冻结了"。
-	var failedKinds []fault.Kind
+	// 本轮所有失败：对外只回一个结论，但运维记录里一条都不能少。
+	var failures []fault.Verdict
+	// 同一个号上的渠道病重试次数，换号后清零。
+	sameKeyRetries := 0
+	lastKey := ""
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		lease, err := s.d.Pool.Acquire(pool.PickRequest{
@@ -127,15 +133,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			PreferKeyID: preferKey,
 		})
 		if err != nil {
-			// 已经有上游错误时保留它：把上游的 500 改写成网关的 503，
-			// 会让排障的人以为是网关容量问题，实际是上游在炸。
-			if lastStatus == 0 {
-				lastStatus = http.StatusServiceUnavailable
-				lastBody = errJSON("NO_CAPACITY", err.Error())
-				lastErr = err.Error()
-				// 选不到号也要留一条日志：池空了/全都在冷却是最需要人介入的故障，
-				// 不记的话面板上什么都看不到。
-				s.noteFailure(r, reqID, nil, model, path, lastStatus, attempt, start, "", err.Error())
+			// 一个号都没试过（池空 / 全在冷却）：这属于"暂时没有容量"，
+			// 503 + Retry-After 让客户端稍后再来，比 502"网关坏了"准确。
+			if len(failures) == 0 {
+				v := fault.Verdict{
+					Canonical:  fault.CServerOverloaded,
+					Kind:       fault.Upstream,
+					RuleID:     "pool.no_lease",
+					Message:    err.Error(),
+					RetryAfter: 30 * time.Second,
+				}
+				s.stats.Failed.Add(1)
+				s.noteFailure(r, reqID, nil, model, path, v, attempt, start, "", err.Error())
+				s.writeFault(w, reqID, v, "")
+				s.d.Daily.Add(time.Now(), 0, 0, 0, true)
+				return
 			}
 			break
 		}
@@ -147,54 +159,66 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				s.stats.Switched.Add(1)
 			}
 		}
+		if lease.KeyID != lastKey {
+			sameKeyRetries = 0
+		}
 		lastKey = lease.KeyID
 
 		ctx, cancel := context.WithTimeout(r.Context(), s.timeoutFor(isVideoCreate || isVideoQuery))
 		res, err := s.d.Up.Do(ctx, r.Method, path, body, lease.Secret, r.Header, stream)
 		if err != nil {
 			cancel()
+			v := fault.ClassifyNet(err)
 			s.d.Pool.Release(lease, pool.Outcome{
-				Kind: fault.Upstream, Model: model, Message: err.Error(),
+				Kind: v.Kind, Model: model, Message: err.Error(),
 			})
-			lastStatus = http.StatusBadGateway
-			lastBody = errJSON("UPSTREAM_ERROR", publicErrMessage(err))
-			lastErr = err.Error()
-			failedKinds = append(failedKinds, fault.Upstream)
-			s.noteFailure(r, reqID, lease, model, path, lastStatus, attempt, start, "", err.Error())
+			failures = append(failures, v)
+			s.noteFailure(r, reqID, lease, model, path, v, attempt, start, "", "")
 			if attempt < maxAttempts && !sleepCtx(r.Context(), backoffFor(attempt-1)) {
 				return
 			}
 			continue
 		}
 
-		if res.Status >= 400 {
+		// 200 里带 error 成员也要当失败：当成功处理会记一条空补全并计费。
+		broken := res.Status >= 400
+		if !broken && res.Stream == nil && fault.SuccessCarriesError(res.Body) {
+			broken = true
+		}
+		if broken {
 			res.Close()
 			cancel()
 			v := fault.Classify(res.Status, res.Body, res.Header)
 			s.d.Pool.Release(lease, pool.Outcome{
 				Kind: v.Kind, Model: model, Message: v.Message, RetryAfter: v.RetryAfter,
 			})
-			lastStatus, lastBody, lastErr = res.Status, res.Body, v.Message
-			lastHeader = res.Header
-			failedKinds = append(failedKinds, v.Kind)
-			s.noteFailure(r, reqID, lease, model, path, res.Status, attempt, start, res.TraceID, v.Message)
+			failures = append(failures, v)
+			s.noteFailure(r, reqID, lease, model, path, v, attempt, start, res.TraceID, "")
 
-			if !v.Retryable {
-				break // 4xx 里认不出来的那些：请求本身有问题，换号也没用
+			// 请求病：换谁都一样。立刻返回，别把 N 个号都撞一遍。
+			if v.RequestFault() || !v.Retryable || attempt >= maxAttempts {
+				break
 			}
-			if v.Kind == fault.UpstreamRate && attempt < maxAttempts {
-				// 模型侧限流跟号无关：退避后优先用同一个号再试，别把别的号的配额也烧掉。
+
+			switch {
+			case v.SameKeyRetryWorth() && sameKeyRetries < sameKeyRetryLimit:
+				// 裸 5xx：先在同一账号上重试一次。瞬时抖动换号救不了，
+				// 反而把新号也拖进熔断统计。
+				sameKeyRetries++
+				delete(tried, lease.KeyID)
+				preferKey = lease.KeyID
+				if !sleepCtx(r.Context(), jitterDur(sameKeyPause)) {
+					return
+				}
+				continue
+			case v.Kind == fault.UpstreamRate:
+				// 模型侧限流跟号无关：退避后优先用同一个号，别烧别的号的配额。
 				if !sleepCtx(r.Context(), rateBackoff(attempt, v.RetryAfter)) {
 					return
 				}
 				delete(tried, lease.KeyID)
 				preferKey = lease.KeyID
 				continue
-			}
-			if v.Kind == fault.Upstream && attempt < maxAttempts {
-				if !sleepCtx(r.Context(), backoffFor(attempt-1)) {
-					return
-				}
 			}
 			continue
 		}
@@ -206,61 +230,98 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 全部尝试失败：把上游原样回给客户端（能保留真实原因），没有上游响应才自己造。
+	// 全部尝试失败：按"对调用方的行动价值"挑一个结论，不是拿最后一个凑数。
 	s.stats.Failed.Add(1)
-	if lastStatus == 0 {
-		lastStatus = http.StatusBadGateway
+	final, ok := fault.PickFinal(failures)
+	if !ok {
+		final = fault.Verdict{Canonical: fault.CUnknown, Kind: fault.Upstream, RuleID: "pool.no_attempt"}
 	}
-	if lastBody == nil {
-		lastBody = errJSON("UPSTREAM_ERROR", lastErr)
-	}
-
-	// 整轮都栽在"号欠费 / 号被冻结"上：这是号池的账，不是客户端的账。
-	//
-	// 原样透传上游的 402/403 会让调用方以为自己欠费、或被永久拒绝，去查自己的账号，
-	// 而真正要做的是给号充值 / 等解封——还得有人在面板上数一遍才知道是哪个号。
-	// 所以这里改写成网关自己的 503，并把池子现状写进 message。
-	if onlyDeadKeys(failedKinds) {
-		total, healthy, cooling, invalid, exhausted, blocked, disabled := s.d.Pool.Counts()
-		// 池子规模、欠费/冻结的分布是内部经营数据：抛给客户端等于告诉对方
-		// "这后面挂着 N 个号，其中 M 个已经没钱了"。客户端只需要知道
-		// "不是你的事，重试或找服务方"，所以对外只回一句中性的容量不足，
-		// 明细走 reqlog——面板上照样能查到这一轮到底撞了什么。
-		detail := fmt.Sprintf("本轮 %d 个号全部欠费或冻结（池内共 %d 个：欠费 %d、冻结 %d、失效 %d、冷却 %d、禁用 %d、可用 %d）",
-			len(failedKinds), total, exhausted, blocked, invalid, cooling, disabled, healthy)
-		lastStatus = http.StatusServiceUnavailable
-		lastBody = errJSON("NO_CAPACITY", "当前无可用容量，请稍后重试")
-		lastErr = detail
-		s.noteFailure(r, reqID, nil, model, path, http.StatusServiceUnavailable, maxAttempts, start, "", detail)
-	}
-
-	// 不再回任何 X-Trpool-* 头：号名、第几次尝试、上游 trace_id 都是渠道内部信息，
-	// 客户端拿到只会泄露"背后有一池号"。排障这些信息在面板日志与 reqlog 里都有，
-	// 失败原因也能从 body 的 error.code（NO_CAPACITY / UPSTREAM_ERROR…）读出来。
-	//
-	// body 同样要过一遍脱敏：失败时透传的是上游原话，里面可能带着上游的
-	// traceId、以及 402 那句"充值地址：https://<上游域名>/account/recharge"。
-	copyResponseHeaders(w, lastHeader, false)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(lastStatus)
-	_, _ = w.Write(s.scrub.Body(lastBody))
+	s.noteFailure(r, reqID, nil, model, path, final, maxAttempts, start, "", summarize(failures))
+	s.writeFault(w, reqID, final, "")
 	s.d.Daily.Add(time.Now(), 0, 0, 0, true)
 }
 
-// publicErrMessage 是给客户端看的网络错误文案。
-//
-// upstream 层包出来的错误里带着完整 URL（Go 的 *url.Error 形如
-// `Get "https://<上游>/v1/chat/completions": dial tcp ...`），原样回给客户端
-// 等于把上游域名和端点路径送出去。而 "connection refused" 对调用方没有任何
-// 可操作价值，所以对外只给一句粗粒度描述，细节留在 reqlog。
-func publicErrMessage(err error) string {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return "上游响应超时，请稍后重试"
-	case errors.Is(err, context.Canceled):
-		return "请求已取消"
+// summarize 把本轮每个号的失败压成一行，给 reqlog 与面板用。
+// 形如 `2×insufficient_quota(402 INSUFFICIENT_BALANCE) 1×rate_limit_exceeded(429)`。
+func summarize(vs []fault.Verdict) string {
+	if len(vs) == 0 {
+		return ""
 	}
-	return "上游连接失败，请稍后重试"
+	type key struct {
+		c      fault.Canonical
+		status int
+		code   string
+	}
+	var order []key
+	count := map[key]int{}
+	for _, v := range vs {
+		k := key{v.Canonical, v.Status, v.RawCode}
+		if count[k] == 0 {
+			order = append(order, k)
+		}
+		count[k]++
+	}
+	var b strings.Builder
+	for i, k := range order {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(strconv.Itoa(count[k]))
+		b.WriteString("×")
+		b.WriteString(string(k.c))
+		b.WriteString("(")
+		if k.status > 0 {
+			b.WriteString(strconv.Itoa(k.status))
+		} else {
+			b.WriteString("transport")
+		}
+		if k.code != "" {
+			b.WriteString(" ")
+			b.WriteString(k.code)
+		}
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+// writeFault 是 /v1 链路唯一的错误出口。
+//
+// 出站只有四个字段：message / type / code / request_id，message 来自模板。
+// **上游返回的任何文本都不进来**——不是"过滤后透传"，是"不透传"：
+// 正则拦得住邮箱和 JWT，拦不住"你本月还剩 3 次"这种纯数字句子。
+//
+// message 参数只允许放**我方**自己写的话（例如"网关密钥无效"），
+// 任何来自上游的字符串都不许从这里经过。
+func (s *Server) writeFault(w http.ResponseWriter, reqID string, v fault.Verdict, message string) {
+	sp := fault.SpecOf(v.Canonical)
+	if message == "" {
+		message = fault.Message(v.Canonical, int(v.RetryAfter/time.Second), reqID)
+	}
+	if sp.RetryAfter {
+		secs := int(v.RetryAfter / time.Second)
+		if secs <= 0 {
+			secs = sp.RetryAfterDefault
+		}
+		if secs > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(sp.HTTP)
+	_, _ = w.Write(faultBody(v.Canonical, sp.Type, message, reqID))
+}
+
+func faultBody(code fault.Canonical, typ, message, reqID string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message":    message,
+			"type":       typ,
+			"code":       string(code),
+			"request_id": reqID,
+		},
+	})
+	return b
 }
 
 func (s *Server) timeoutFor(video bool) time.Duration {
@@ -290,7 +351,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 		w.WriteHeader(res.Status)
 
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, werr := s.pipeSSE(sw, res.Stream, start)
+		u, ttfb, werr := s.pipeSSE(sw, res.Stream, reqID, true, start)
 		sw.Close()
 
 		entry.LatencyMS = time.Since(start).Milliseconds()
@@ -347,6 +408,9 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, res *upstream.R
 }
 
 // serveDirect 是"客户端自带 sk_tr_ 直连"模式：不选号、不记额度，但仍然记日志。
+//
+// 这条路径上凭据是调用方自己的，上游的错误体对他没有保密价值（他自己就是那个账号），
+// 所以 body 原样透传；只把传输层错误归一到 canonical。
 func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte, meta reqMeta, reqID string, start time.Time) {
 	stream := meta.Stream || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 	tok, _ := httpauth.Credential(r)
@@ -356,11 +420,15 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 
 	res, err := s.d.Up.Do(ctx, r.Method, r.URL.Path, body, tok, r.Header, stream)
 	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "UPSTREAM_ERROR", err.Error())
+		s.writeFault(w, reqID, fault.ClassifyNet(err), "")
 		return
 	}
 	if res.Status >= 400 {
 		defer res.Close()
+		// Retry-After 归一为秒再给：上游可能给 HTTP-date，客户端解析不了就会立刻重试。
+		if ra := fault.RetryAfter(res.Header, res.Body); ra > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(ra/time.Second)))
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(res.Status)
 		_, _ = w.Write(res.Body)
@@ -378,7 +446,7 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 		copyResponseHeaders(w, res.Header, true)
 		w.WriteHeader(res.Status)
 		sw := newStreamWriter(w, s.d.Cfg.Server.StreamKeepalive.Duration())
-		u, ttfb, _ := s.pipeSSE(sw, res.Stream, start)
+		u, ttfb, _ := s.pipeSSE(sw, res.Stream, reqID, false, start)
 		sw.Close()
 		entry.LatencyMS = time.Since(start).Milliseconds()
 		entry.TTFBMS = ttfb
@@ -401,22 +469,6 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, body []byte
 
 // ---------- 辅助 ----------
 
-// onlyDeadKeys 判断这一轮失败是否全部来自"号欠费(quota) / 号被冻结(banned)"。
-//
-// 只认这两种：掺进一条 5xx、网络错误或 429，就说明池子不是"全死了"，
-// 那种情况保留上游原文更有排障价值。
-func onlyDeadKeys(kinds []fault.Kind) bool {
-	if len(kinds) == 0 {
-		return false
-	}
-	for _, k := range kinds {
-		if k != fault.Quota && k != fault.Banned {
-			return false
-		}
-	}
-	return true
-}
-
 // passthroughHeaders 是唯一允许从上游透传给客户端的响应头。
 //
 // 老实现是黑名单：只挡 hop-by-hop，其余原样转发。结果是上游把自己的实现细节
@@ -426,9 +478,11 @@ func onlyDeadKeys(kinds []fault.Kind) bool {
 // 这些对客户端毫无用处，却是实打实的渠道泄露。
 //
 // 改成白名单：只留客户端真正需要的那几个。漏掉一个头的代价远小于漏掉内部实现。
+//
+// 注意 Retry-After **不在**这里：上游给的可能是不合规的 HTTP-date 或离谱大数，
+// 由 writeFault 统一归一成秒后再设置，不能让它原样穿过去覆盖掉。
 var passthroughHeaders = map[string]bool{
 	"content-type":        true, // 必需：区分 JSON 与 text/event-stream
-	"retry-after":         true, // 429/503 的重试语义，客户端退避行为依赖它
 	"content-disposition": true, // 文件/附件下载的文件名
 	"content-range":       true, // 分片下载
 	"accept-ranges":       true,

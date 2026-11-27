@@ -44,6 +44,13 @@ type Entry struct {
 	TraceID  string `json:"trace_id,omitempty"`
 	// Error 是"这次请求失败了"。
 	Error string `json:"error,omitempty"`
+	// Canonical / RuleID / Raw* 是同一行的"运维视图"：对外给的是 canonical 模板，
+	// 这里留住上游到底说了什么。两条分开记，才能回答"用户看到的报错对应上游哪句话"。
+	Canonical  string `json:"canonical,omitempty"`
+	RuleID     string `json:"rule_id,omitempty"`
+	RawStatus  int    `json:"raw_status,omitempty"`
+	RawCode    string `json:"raw_code,omitempty"`
+	RawMessage string `json:"raw_message,omitempty"`
 	// Note 是"成功了但有话要说"（客户端中途断开、usage 是估算的）。
 	// 和 Error 分开是因为面板的"仅失败/最近异常"按 Error 判定：
 	// 用户按了 Ctrl-C 不该被算成一次故障，否则异常面板永远被噪声刷满。

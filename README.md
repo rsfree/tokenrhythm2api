@@ -150,12 +150,15 @@ print(client.chat.completions.create(
 | 头 | 为什么留 |
 |---|---|
 | `Content-Type` | 客户端必须能区分 JSON 与 `text/event-stream` |
-| `Retry-After` | 429/503 的退避语义，客户端行为依赖它 |
 | `Content-Disposition` | 文件下载的文件名 |
 | `Range` 相关（`Content-Range`、`Accept-Ranges`） | 分片下载 |
 
+`Retry-After` **不在白名单里**：上游给的可能是不合规的 HTTP-date 或离谱的大数，
+由错误出口按 canonical 归一成秒后再设置（限流 60 / 过载 30 / `api_error` 5，
+`insufficient_quota` 不给），不让它原样穿过去。
+
 其余一律丢弃。排障需要的信息（是哪个号、第几次、上游 trace）都在面板「运行日志」
-与 `data/requests/*.jsonl` 里，客户端按 `error.code`（`NO_CAPACITY` / `UPSTREAM_ERROR`…）判断即可。
+与 `data/requests/*.jsonl` 里，客户端按 `error.code`（13 个 canonical 之一，见下节）判断即可。
 
 **body 也过一遍脱敏**（`internal/redact`）。上游在自己 JSON 里塞了不少"这不是给客户看的"字段：
 
@@ -330,22 +333,28 @@ TTL 默认 30 分钟，表上限 2000 条（超了淘汰最久未用）。**粘�
 
 ## 容错
 
-分类逻辑集中在 `internal/fault`：只看 `状态码 + body + Retry-After`，输出一个 `Verdict`，
-由 `pool` 决定后果。**同一个状态码的不同 body 是不同的事**，这是整套容错的前提。
+分类逻辑集中在 `internal/fault`：按 `<status, code, type, message>` 判定（code 优先，
+status 只是最后一跳），输出一个 `Verdict`。**同一个状态码的不同 body 是不同的事**，
+这是整套容错的前提，也是错误契约成立的前提。
 
-| 上游返回 | 类别 | 号的后果 | 是否换号 |
-|---|---|---|---|
-| 2xx | — | 失败计数清零，回到 `active` | — |
-| 401 | `auth` | `invalid`，不自动恢复，需人工重置 | 是 |
-| 402 / body 含 `INSUFFICIENT_BALANCE` | `quota` | `exhausted`（余额耗尽）**命中即停用**，不设冷却、不会自动复活；充值后补额度或点「恢复」 | 是 |
-| **403 + `ACCOUNT_SUSPENDED`** | `banned` | `blocked`（账号已冻结）**命中即停用**；**不计入 429 压力**，解封后点「恢复」 | 是 |
-| **403 + `MODEL_ACCESS_DENIED`** | `model_denied` | **只封「号 × 模型」**，6h 起指数退避 | 是 |
-| 403 其它 | `quota` | 保守按欠费处理（停用） | 是 |
-| **429 + `RATE_LIMITED`** | `rate` | `cooling`，按 `retryAfterSeconds` 精确冷却 | 是 |
-| **429 + `UPSTREAM_RATE_LIMITED`** | `upstream_rate` | **只冷「号 × 模型」**（30s），优先同号重试 | 是 |
-| 429 无标记 | `rate` | 同上，无提示时 20s 起指数退避 | 是 |
-| 5xx / 超时 | `upstream` | 连续 3 次熔断，30s 起指数退避 | 是 |
-| 其它 4xx | `client` | **不罚号**，立即原样返回 | 否 |
+`Verdict` 里有**两套结论**，混用会同时弄坏两边：
+
+- `Canonical`：对外唯一允许出现的 13 个 code（见「错误契约」），面向调用方；
+- `Kind`：内部调度语义（下表），决定换号、冷却、熔断、是否终态停用。
+
+| 上游返回 | `Kind` | 对外 `canonical` | 号的后果 | 是否换号 |
+|---|---|---|---|---|
+| 2xx | — | — | 失败计数清零，回到 `active` | — |
+| 401 | `auth` | `authentication_error` | `invalid`，不自动恢复，需人工重置 | 是 |
+| 402 / body 含 `INSUFFICIENT_BALANCE` / `Arrearage` / `AccountOverdueError` | `quota` | `insufficient_quota` (429) | `exhausted`（余额耗尽）**命中即停用**，不设冷却、不会自动复活；充值后补额度或点「恢复」 | 是 |
+| **403 + `ACCOUNT_SUSPENDED`** | `banned` | `authentication_error` (401) | `blocked`（账号已冻结）**命中即停用**；**不计入 429 压力**，解封后点「恢复」 | 是 |
+| **403 + `MODEL_ACCESS_DENIED`** | `model_denied` | `permission_denied` (403) | **只封「号 × 模型」**，6h 起指数退避 | 是 |
+| 403 其它（无 code/hint） | `model_denied` | `permission_denied` (403) | 保守只封「号 × 模型」，未知 403 记 `rule_id` 待补表 | 是 |
+| **429 + `RATE_LIMITED`** | `rate` | `rate_limit_exceeded` (429) | `cooling`，按 `retryAfterSeconds` 精确冷却 | 是 |
+| **429 + `UPSTREAM_RATE_LIMITED`** | `upstream_rate` | `rate_limit_exceeded` (429) | **只冷「号 × 模型」**（30s），优先同号重试 | 是 |
+| 429 + 过载 code / hint | `upstream` | `server_is_overloaded` (503) | 熔断计数 | 是（先同号重试 1 次） |
+| 5xx / 超时 | `upstream` | `api_error` (500) / `upstream_timeout` (504) | 连续 3 次熔断，30s 起指数退避 | 是 |
+| 其它 4xx | `client` | 见 13 码表 | **不罚号**，立即返回模板文案 | 否 |
 
 ### 模型级封禁（`(key, model)`）
 
@@ -457,25 +466,60 @@ cost = (prompt − cached) × input + cached × cache_read + completion × outpu
 写盘按 32 条一批 flush，`retention_days` 与 `request_archive_max_mb` 任一超限就按天淘汰旧文件；
 面板查询前会先 flush 一次，所以"刚发生的那一条"切过去就能看到，不用等下一批。
 
-**选不到号也会留一条记录**（`503 NO_CAPACITY`，号名为空）：池空了、全部冷却、全部 401 失效，
-是最需要人介入的故障，不该在面板上完全静默。
+**选不到号也会留一条记录**（`503 server_is_overloaded`，号名为空）：池空了、全部冷却、
+全部 401 失效，是最需要人介入的故障，不该在面板上完全静默。
 
-### 号全欠费/冻结时不透传 402
+### 错误契约：13 个 canonical，上游 status 只是传输标签
 
-一轮里被撞到的号**全部**是 402（欠费）/ 403（冻结）时，网关不会把上游那句
-`INSUFFICIENT_BALANCE` 原样丢给客户端——那是**号池的账**，不是调用方的账，
-透传只会让人去查自己的账号。改成网关自己的 503，且**不描述池子状态**：
-池里有几个号、几个欠费、还剩几个可用，都是内部经营数据。
+上游的 HTTP 状态码**不是语义**，只是这一跳的传输结果。实测同一个 429 里同时住着
+「限流」「余额耗尽」「服务过载」三种完全相反的结论；而「余额耗尽」在不同上游可以是
+402 / 403 / 429。所以判定单元是 `<status, code, type, message>` 四元组，顺序固定：
 
-```json
-{"error":{"code":"NO_CAPACITY","type":"NO_CAPACITY","message":"当前无可用容量，请稍后重试"}}
+```
+provider 业务码 → 厂商 code/type → message hint（受控词表）→ status 兜底 → unknown
 ```
 
-这一轮到底撞了什么（`本轮 2 个号全部欠费或冻结（池内共 2 个：欠费 2、冻结 0…可用 0）`）
-写进 `data/requests/*.jsonl` 与面板「运行日志」，客户端拿不到。
+**禁止跳级**：不允许"看到 429 就判限流"——过载与欠费必须先被 code/hint 排除掉。
 
-**5xx / 网络错误 / 429 掺进来一条就不改写**——那种情况保留上游原文排障更有用
-（原文同样会过 body 脱敏，删掉 `traceId` 与上游域名）。
+对外只允许这 13 个 code：
+
+| code | HTTP | 谁的问题 | 换号重试 |
+|---|---|---|---|
+| `invalid_request_error` / `context_length_exceeded` / `content_policy_violation` / `request_too_large` | 400/400/400/413 | 请求 | ❌ 换谁都一样 |
+| `authentication_error` / `permission_denied` / `model_not_found` | 401/403/404 | 账号/权限 | ✅ / ✅（按模型）/ ❌ |
+| `rate_limit_exceeded` | 429 | 账号（短期） | ✅ 按 Retry-After |
+| `insufficient_quota` | 429 | 账号（长期） | ✅ 但重试不会让余额变多 |
+| `server_is_overloaded` / `api_error` / `upstream_timeout` | 503/500/504 | 渠道 | ✅ 渠道病 |
+| `unknown_upstream_error` | 502 | 兜底 | 视情况，必须补表 |
+
+**对外响应只有四个字段**，`message` 由模板生成：
+
+```json
+{"error":{"code":"insufficient_quota","type":"insufficient_quota",
+  "message":"服务方额度已用尽，在服务方充值前重试无效","request_id":"5cd76eaadd9215181ef25c17970217dc"}}
+```
+
+上游原文（`INSUFFICIENT_BALANCE`、`https://<上游>/account/recharge`、`traceId`、
+"账户余额不足"）一个字都不出去——不是"过滤后透传"，是**不透传**：正则拦得住邮箱和 JWT，
+拦不住"你本月还剩 3 次"这种纯数字句子。运维侧同一行里留住两个视图：
+
+```
+[req] id=ef292e4b6166 key= model=glm-5.1 /v1/chat/completions 429 2ms attempt=2
+      canon=insufficient_quota/tr.quota.balance raw=402 INSUFFICIENT_BALANCE err=2×insufficient_quota(402 …)
+```
+
+几个容易做歪的点，都用测试锁住了：
+
+- **请求病不换号**。`invalid_request_error` 拿去轮换账号，30 个号就是 30 次无效调用 30 次计费。
+- **欠费是终态**，不带 `Retry-After`——给了时间会让客户端以为等一会儿能恢复。
+- **`Retry-After` 归一为秒并截断 900s**。上游可能给 HTTP-date 或 `"60s"`，
+  原样透传 → 客户端解析失败 → 立即重试 → 一次 429 变成雪崩。
+- **200 里带 `error` 成员也算失败**（`api_error`）。当成功处理会记一条空补全并计费。
+- **流式已发 200 后报错**：状态码改不了，把 `data:` 里的错误帧换成同一份 canonical body。
+- **全池失败时按"对调用方的行动价值"选一个**，不是拿最后一个凑数：
+  请求病 > `insufficient_quota` > `authentication_error` > `permission_denied` > 渠道病 > `rate_limit_exceeded`。
+  全池欠费对外就是 429 `insufficient_quota`（明确告诉调用方"等也没用"），
+  不再自造 `NO_CAPACITY`；池里有几个号、几个欠费仍然只进运维日志。
 
 日志页右上角「历史归档」按钮切成归档模式（服务端过滤，因为归档可能有几十万行）。
 
